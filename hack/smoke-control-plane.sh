@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # control-plane smoke test: from a wiped state dir, bring the cluster up and check that
-# the node is Ready, the apiserver is healthy, the Lease renews, the apiserver
-# reaches the node agent, and the node identity is scoped by the Node
-# authorizer and NodeRestriction.
+# the node is Ready, the apiserver is healthy, the Lease renews, the node
+# agent answers on its InternalIP with the apiserver's client cert, and the
+# node identity is scoped by the Node authorizer and NodeRestriction.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -80,9 +80,23 @@ echo "Ready lastHeartbeatTime: $h1 -> $h2"
 [ "$h1" != "$h2" ] || fail "node status was not updated in 11s"
 
 step "apiserver reaches the node agent with its kubelet client cert"
-p=$("$KUBECTL" get --raw "/api/v1/nodes/$NODE/proxy/healthz")
-echo "/api/v1/nodes/$NODE/proxy/healthz: $p"
-[ "$p" = "ok" ] || fail "node proxy healthz returned $p"
+# The node's InternalIP is 127.0.0.1 and the apiserver dials InternalIP, so
+# logs and exec work offline (hack/m1.sh exercises both). The node proxy
+# subresource refuses addresses that are not global unicast, so it cannot
+# reach a loopback node; check the address and the client cert directly.
+addr=$("$KUBECTL" get node "$NODE" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
+echo "node InternalIP: $addr"
+[ "$addr" = "127.0.0.1" ] || fail "node InternalIP is $addr, not 127.0.0.1"
+p=$(curl -sS --cacert "$PKI/ca.crt" --cert "$PKI/apiserver-kubelet-client.crt" --key "$PKI/apiserver-kubelet-client.key" \
+	"https://$addr:10250/healthz")
+echo "https://$addr:10250/healthz with the apiserver kubelet client cert: $p"
+[ "$p" = "ok" ] || fail "kubelet healthz returned $p"
+if out=$("$KUBECTL" get --raw "/api/v1/nodes/$NODE/proxy/healthz" 2>&1); then
+	echo "/api/v1/nodes/$NODE/proxy/healthz: $out"
+else
+	echo "/api/v1/nodes/$NODE/proxy/healthz refused for a loopback node, as expected: $out"
+	echo "$out" | grep -q 'address not allowed' || fail "node proxy failed for another reason: $out"
+fi
 
 step "node agent port rejects clients without a cluster CA cert"
 if out=$(curl -sS --cacert "$PKI/ca.crt" "https://127.0.0.1:10250/healthz" 2>&1); then
