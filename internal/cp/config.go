@@ -21,6 +21,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // Network facts shared by the control plane and the node agent.
@@ -172,8 +174,16 @@ func executable(p string) bool {
 	return err == nil && !st.IsDir() && st.Mode()&0o111 != 0
 }
 
-// NodeName returns the short hostname, lowercased.
+// NodeName returns $BRIGLET_NODE_NAME, or the short hostname, lowercased.
+// The name ends up in the node's certificates, so changing it on an
+// existing state directory needs `briglet down --wipe`.
 func NodeName() (string, error) {
+	if n := os.Getenv("BRIGLET_NODE_NAME"); n != "" {
+		if errs := validation.IsDNS1123Subdomain(n); len(errs) > 0 {
+			return "", fmt.Errorf("BRIGLET_NODE_NAME %q: %s", n, strings.Join(errs, "; "))
+		}
+		return n, nil
+	}
 	h, err := os.Hostname()
 	if err != nil {
 		return "", err

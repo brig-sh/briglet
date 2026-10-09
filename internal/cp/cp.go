@@ -29,6 +29,8 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 )
@@ -62,6 +64,13 @@ func NewCluster() (*Cluster, error) {
 	}
 	bins, err := ResolveBinaries()
 	if err != nil {
+		return nil, err
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	if self, err = filepath.EvalSymlinks(self); err != nil {
 		return nil, err
 	}
 	pki := func(f string) string { return filepath.Join(p.PKI, f) }
@@ -140,6 +149,13 @@ func NewCluster() (*Cluster, error) {
 		"--tls-private-key-file="+pki("scheduler-serving.key"),
 		"--leader-elect=false",
 	)
+	node := NewProc(p, "node", self, "node",
+		"--kubeconfig="+p.Kubeconfig("node"),
+		"--name="+name,
+		"--tls-cert-file="+pki("kubelet-serving.crt"),
+		"--tls-private-key-file="+pki("kubelet-serving.key"),
+		"--client-ca-file="+pki("ca.crt"),
+	)
 
 	c.Components = []*Component{
 		{Proc: etcd, Port: EtcdClientPort, Health: func(ctx context.Context) error {
@@ -160,6 +176,12 @@ func NewCluster() (*Cluster, error) {
 		{Proc: sched, Port: SchedulerPort, Health: func(ctx context.Context) error {
 			_, err := c.get(ctx, fmt.Sprintf("https://127.0.0.1:%d/healthz", SchedulerPort), "")
 			return err
+		}},
+		{Proc: node, Port: KubeletPort, Health: func(ctx context.Context) error {
+			if _, err := c.get(ctx, fmt.Sprintf("https://127.0.0.1:%d/healthz", KubeletPort), "apiserver-kubelet-client"); err != nil {
+				return err
+			}
+			return c.nodeReady(ctx)
 		}},
 	}
 	return c, nil
@@ -207,6 +229,37 @@ func (c *Cluster) Clientset() (*kubernetes.Clientset, error) {
 	}
 	cfg.Timeout = 5 * time.Second
 	return kubernetes.NewForConfig(cfg)
+}
+
+func (c *Cluster) nodeReady(ctx context.Context) error {
+	cs, err := c.Clientset()
+	if err != nil {
+		return err
+	}
+	n, err := cs.CoreV1().Nodes().Get(ctx, c.NodeName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	ready := false
+	for _, cond := range n.Status.Conditions {
+		if cond.Type == corev1.NodeReady {
+			if cond.Status != corev1.ConditionTrue {
+				return fmt.Errorf("node %s Ready=%s: %s", c.NodeName, cond.Status, cond.Message)
+			}
+			ready = true
+		}
+	}
+	if !ready {
+		return fmt.Errorf("node %s has no Ready condition yet", c.NodeName)
+	}
+	// The node lifecycle controller taints a new node not-ready until it
+	// observes the Ready condition. Wait for that so the node is schedulable.
+	for _, t := range n.Spec.Taints {
+		if t.Key == corev1.TaintNodeNotReady || t.Key == corev1.TaintNodeUnreachable {
+			return fmt.Errorf("node %s still has taint %s", c.NodeName, t.Key)
+		}
+	}
+	return nil
 }
 
 // Up starts every component that is not already running and waits for each

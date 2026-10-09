@@ -20,20 +20,24 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/brig-sh/briglet/internal/cp"
+	"github.com/brig-sh/briglet/internal/node"
 )
 
 const usage = `usage: briglet <command> [flags]
 
 commands:
-  up              start etcd and the control plane
+  up              start etcd, the control plane and the node agent
   down [--wipe]   stop everything; --wipe also removes the state dir
   status          show component pids and health
+  node            run the node agent in the foreground
 `
 
 func main() {
@@ -51,6 +55,8 @@ func main() {
 		err = cmdDown(os.Args[2:])
 	case "status":
 		err = cmdStatus(ctx)
+	case "node":
+		err = cmdNode(ctx, os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 	default:
@@ -72,7 +78,7 @@ func cmdUp(ctx context.Context) error {
 	if err := c.Up(ctx, os.Stdout); err != nil {
 		return err
 	}
-	fmt.Printf("briglet up took %.2fs\n", time.Since(start).Seconds())
+	fmt.Printf("briglet up took %.2fs; node %s is Ready\n", time.Since(start).Seconds(), c.NodeName)
 	fmt.Printf("export KUBECONFIG=%s\n", c.Paths.AdminKubeconfig)
 	return nil
 }
@@ -94,4 +100,31 @@ func cmdStatus(ctx context.Context) error {
 		return err
 	}
 	return c.Status(ctx, os.Stdout)
+}
+
+func cmdNode(ctx context.Context, args []string) error {
+	p, err := cp.NewPaths()
+	if err != nil {
+		return err
+	}
+	name, err := cp.NodeName()
+	if err != nil {
+		return err
+	}
+	hull := os.Getenv("HULL_BIN")
+	if hull == "" {
+		hull = "/opt/homebrew/bin/hull"
+	}
+	cfg := node.Config{StateDir: p.Root, HullBin: hull}
+	fs := flag.NewFlagSet("node", flag.ExitOnError)
+	fs.StringVar(&cfg.Kubeconfig, "kubeconfig", p.Kubeconfig("node"), "kubeconfig with the node's client credentials")
+	fs.StringVar(&cfg.Name, "name", name, "Node name")
+	fs.StringVar(&cfg.NodeIP, "node-ip", cp.GatewayIP, "InternalIP reported for the node")
+	fs.IntVar(&cfg.Port, "port", cp.KubeletPort, "kubelet HTTPS port")
+	fs.StringVar(&cfg.TLSCertFile, "tls-cert-file", filepath.Join(p.PKI, "kubelet-serving.crt"), "kubelet serving cert")
+	fs.StringVar(&cfg.TLSKeyFile, "tls-private-key-file", filepath.Join(p.PKI, "kubelet-serving.key"), "kubelet serving key")
+	fs.StringVar(&cfg.ClientCAFile, "client-ca-file", filepath.Join(p.PKI, "ca.crt"), "CA that signs accepted client certs")
+	_ = fs.Parse(args)
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	return node.Run(ctx, cfg)
 }
