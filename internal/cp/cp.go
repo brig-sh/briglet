@@ -1,0 +1,335 @@
+// Copyright (c) 2026, NOFire AI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package cp
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
+)
+
+const readyTimeout = 90 * time.Second
+
+// Component is one control plane process plus how to tell that it is ready.
+type Component struct {
+	*Proc
+	Port int
+	// Health probes the component once; nil means ready.
+	Health func(ctx context.Context) error
+}
+
+// Cluster is the full set of components in start order.
+type Cluster struct {
+	Paths      Paths
+	NodeName   string
+	Components []*Component
+}
+
+// NewCluster builds the component list. It does not start anything.
+func NewCluster() (*Cluster, error) {
+	p, err := NewPaths()
+	if err != nil {
+		return nil, err
+	}
+	name, err := NodeName()
+	if err != nil {
+		return nil, err
+	}
+	bins, err := ResolveBinaries()
+	if err != nil {
+		return nil, err
+	}
+	pki := func(f string) string { return filepath.Join(p.PKI, f) }
+	c := &Cluster{Paths: p, NodeName: name}
+
+	etcd := NewProc(p, "etcd", bins.Etcd,
+		"--name=briglet",
+		"--data-dir="+p.Etcd,
+		fmt.Sprintf("--listen-client-urls=https://127.0.0.1:%d", EtcdClientPort),
+		fmt.Sprintf("--advertise-client-urls=https://127.0.0.1:%d", EtcdClientPort),
+		fmt.Sprintf("--listen-peer-urls=http://127.0.0.1:%d", EtcdPeerPort),
+		fmt.Sprintf("--initial-advertise-peer-urls=http://127.0.0.1:%d", EtcdPeerPort),
+		fmt.Sprintf("--initial-cluster=briglet=http://127.0.0.1:%d", EtcdPeerPort),
+		fmt.Sprintf("--listen-metrics-urls=http://127.0.0.1:%d", EtcdMetricsPort),
+		"--cert-file="+pki("etcd-server.crt"),
+		"--key-file="+pki("etcd-server.key"),
+		"--trusted-ca-file="+pki("ca.crt"),
+		"--client-cert-auth=true",
+	)
+	apiserver := NewProc(p, "kube-apiserver", bins.APIServer,
+		fmt.Sprintf("--etcd-servers=https://127.0.0.1:%d", EtcdClientPort),
+		"--etcd-cafile="+pki("ca.crt"),
+		"--etcd-certfile="+pki("apiserver-etcd-client.crt"),
+		"--etcd-keyfile="+pki("apiserver-etcd-client.key"),
+		"--bind-address=0.0.0.0",
+		fmt.Sprintf("--secure-port=%d", APIServerPort),
+		"--advertise-address="+GatewayIP,
+		"--tls-cert-file="+pki("apiserver.crt"),
+		"--tls-private-key-file="+pki("apiserver.key"),
+		"--client-ca-file="+pki("ca.crt"),
+		"--service-cluster-ip-range="+ServiceCIDR,
+		"--authorization-mode=Node,RBAC",
+		"--enable-admission-plugins=NodeRestriction",
+		"--enable-bootstrap-token-auth=true",
+		"--service-account-issuer="+SAIssuer,
+		"--service-account-key-file="+pki("sa.pub"),
+		"--service-account-signing-key-file="+pki("sa.key"),
+		"--kubelet-client-certificate="+pki("apiserver-kubelet-client.crt"),
+		"--kubelet-client-key="+pki("apiserver-kubelet-client.key"),
+		"--kubelet-certificate-authority="+pki("ca.crt"),
+		// 10.87.0.1 lives inside the hull gateway netstack, not on a host
+		// interface, so the apiserver reaches the agent by hostname.
+		"--kubelet-preferred-address-types=Hostname,InternalIP",
+	)
+	kcmKC := p.Kubeconfig("controller-manager")
+	kcm := NewProc(p, "kube-controller-manager", bins.ControllerManager,
+		"--kubeconfig="+kcmKC,
+		"--authentication-kubeconfig="+kcmKC,
+		"--authorization-kubeconfig="+kcmKC,
+		"--bind-address=127.0.0.1",
+		fmt.Sprintf("--secure-port=%d", KCMPort),
+		"--tls-cert-file="+pki("controller-manager-serving.crt"),
+		"--tls-private-key-file="+pki("controller-manager-serving.key"),
+		"--controllers=*,bootstrapsigner,tokencleaner",
+		"--allocate-node-cidrs=true",
+		"--cluster-cidr="+ClusterCIDR,
+		"--node-cidr-mask-size=24",
+		"--service-cluster-ip-range="+ServiceCIDR,
+		"--cluster-signing-cert-file="+pki("ca.crt"),
+		"--cluster-signing-key-file="+pki("ca.key"),
+		"--root-ca-file="+pki("ca.crt"),
+		"--service-account-private-key-file="+pki("sa.key"),
+		"--use-service-account-credentials=true",
+		"--leader-elect=false",
+		// The default lives under /usr/libexec, which is read-only on macOS.
+		"--flex-volume-plugin-dir="+filepath.Join(p.Root, "volume-plugins"),
+	)
+	schedKC := p.Kubeconfig("scheduler")
+	sched := NewProc(p, "kube-scheduler", bins.Scheduler,
+		"--kubeconfig="+schedKC,
+		"--authentication-kubeconfig="+schedKC,
+		"--authorization-kubeconfig="+schedKC,
+		"--bind-address=127.0.0.1",
+		fmt.Sprintf("--secure-port=%d", SchedulerPort),
+		"--tls-cert-file="+pki("scheduler-serving.crt"),
+		"--tls-private-key-file="+pki("scheduler-serving.key"),
+		"--leader-elect=false",
+	)
+
+	c.Components = []*Component{
+		{Proc: etcd, Port: EtcdClientPort, Health: func(ctx context.Context) error {
+			body, err := c.get(ctx, fmt.Sprintf("https://127.0.0.1:%d/health", EtcdClientPort), "apiserver-etcd-client")
+			if err == nil && !strings.Contains(body, `"health":"true"`) {
+				err = fmt.Errorf("etcd /health: %s", body)
+			}
+			return err
+		}},
+		{Proc: apiserver, Port: APIServerPort, Health: func(ctx context.Context) error {
+			_, err := c.get(ctx, fmt.Sprintf("https://127.0.0.1:%d/readyz", APIServerPort), "admin")
+			return err
+		}},
+		{Proc: kcm, Port: KCMPort, Health: func(ctx context.Context) error {
+			_, err := c.get(ctx, fmt.Sprintf("https://127.0.0.1:%d/healthz", KCMPort), "")
+			return err
+		}},
+		{Proc: sched, Port: SchedulerPort, Health: func(ctx context.Context) error {
+			_, err := c.get(ctx, fmt.Sprintf("https://127.0.0.1:%d/healthz", SchedulerPort), "")
+			return err
+		}},
+	}
+	return c, nil
+}
+
+// get performs an HTTPS GET verified against the cluster CA, presenting the
+// client cert pki/<clientCert>.{crt,key} when clientCert is not empty.
+func (c *Cluster) get(ctx context.Context, url, clientCert string) (string, error) {
+	caPEM, err := os.ReadFile(filepath.Join(c.Paths.PKI, "ca.crt"))
+	if err != nil {
+		return "", err
+	}
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(caPEM)
+	cfg := &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	if clientCert != "" {
+		kp, err := tls.LoadX509KeyPair(filepath.Join(c.Paths.PKI, clientCert+".crt"), filepath.Join(c.Paths.PKI, clientCert+".key"))
+		if err != nil {
+			return "", err
+		}
+		cfg.Certificates = []tls.Certificate{kp}
+	}
+	hc := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{TLSClientConfig: cfg}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if resp.StatusCode != http.StatusOK {
+		return string(b), fmt.Errorf("GET %s: %s: %s", url, resp.Status, strings.TrimSpace(string(b)))
+	}
+	return string(b), nil
+}
+
+// Clientset returns an admin client for the cluster.
+func (c *Cluster) Clientset() (*kubernetes.Clientset, error) {
+	cfg, err := clientcmd.BuildConfigFromFlags("", c.Paths.AdminKubeconfig)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Timeout = 5 * time.Second
+	return kubernetes.NewForConfig(cfg)
+}
+
+// Up starts every component that is not already running and waits for each
+// to become ready before starting the next.
+func (c *Cluster) Up(ctx context.Context, out io.Writer) error {
+	if err := c.Paths.Mkdirs(); err != nil {
+		return err
+	}
+	if _, err := EnsurePKI(c.Paths.PKI, c.NodeName); err != nil {
+		return fmt.Errorf("pki: %w", err)
+	}
+	if err := WriteKubeconfigs(c.Paths); err != nil {
+		return err
+	}
+	for _, comp := range c.Components {
+		start := time.Now()
+		state := "started"
+		if comp.Pid() != 0 {
+			state = "already running"
+		} else {
+			if portInUse(comp.Port) {
+				return fmt.Errorf("%s: port %d is in use by a process briglet did not start", comp.Name, comp.Port)
+			}
+			if err := comp.Start(); err != nil {
+				return err
+			}
+		}
+		if err := c.waitReady(ctx, comp); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "%-24s ready in %5.2fs (pid %d, %s)\n", comp.Name, time.Since(start).Seconds(), comp.Pid(), state)
+	}
+	return nil
+}
+
+func (c *Cluster) waitReady(ctx context.Context, comp *Component) error {
+	ctx, cancel := context.WithTimeout(ctx, readyTimeout)
+	defer cancel()
+	tick := time.NewTicker(250 * time.Millisecond)
+	defer tick.Stop()
+	var last error
+	for {
+		if last = comp.Health(ctx); last == nil {
+			return nil
+		}
+		select {
+		case <-comp.Exited():
+			return fmt.Errorf("%s exited (%v) before becoming ready; last log lines from %s:\n%s",
+				comp.Name, comp.ExitErr(), comp.LogFile(), comp.TailLog(20))
+		case <-ctx.Done():
+			return fmt.Errorf("%s not ready after %s: %v; see %s", comp.Name, readyTimeout, last, comp.LogFile())
+		case <-tick.C:
+		}
+	}
+}
+
+// Down stops the components in reverse start order. With wipe it also
+// removes the state directory.
+func (c *Cluster) Down(out io.Writer, wipe bool) error {
+	var errs []error
+	for i := len(c.Components) - 1; i >= 0; i-- {
+		comp := c.Components[i]
+		pid := comp.Pid()
+		stopped, err := comp.Stop(15 * time.Second)
+		switch {
+		case err != nil:
+			errs = append(errs, err)
+		case stopped:
+			fmt.Fprintf(out, "%-24s stopped (pid %d)\n", comp.Name, pid)
+		default:
+			fmt.Fprintf(out, "%-24s not running\n", comp.Name)
+		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
+	if wipe {
+		if filepath.Base(c.Paths.Root) != ".briglet" && os.Getenv("BRIGLET_STATE_DIR") == "" {
+			return fmt.Errorf("refusing to wipe unexpected state dir %s", c.Paths.Root)
+		}
+		if err := os.RemoveAll(c.Paths.Root); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "wiped %s\n", c.Paths.Root)
+	}
+	return nil
+}
+
+// Status prints pid and health of every component. It returns an error when
+// any component is down or unhealthy.
+func (c *Cluster) Status(ctx context.Context, out io.Writer) error {
+	bad := 0
+	fmt.Fprintf(out, "%-24s %-8s %s\n", "COMPONENT", "PID", "HEALTH")
+	for _, comp := range c.Components {
+		pid := comp.Pid()
+		health := "ok"
+		if pid == 0 {
+			health, bad = "not running", bad+1
+		} else {
+			hctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			if err := comp.Health(hctx); err != nil {
+				health, bad = err.Error(), bad+1
+			}
+			cancel()
+		}
+		pidStr := "-"
+		if pid != 0 {
+			pidStr = strconv.Itoa(pid)
+		}
+		fmt.Fprintf(out, "%-24s %-8s %s\n", comp.Name, pidStr, health)
+	}
+	fmt.Fprintf(out, "state dir: %s\nlogs:      %s\n", c.Paths.Root, c.Paths.Logs)
+	if bad > 0 {
+		return fmt.Errorf("%d component(s) not healthy", bad)
+	}
+	return nil
+}
+
+func portInUse(port int) bool {
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 300*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
