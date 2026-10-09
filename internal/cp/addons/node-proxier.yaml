@@ -1,0 +1,15 @@
+# The node agent programs the gateway service table from Services and
+# EndpointSlices, as kube-proxy does. The Node authorizer and the system:node
+# rules do not cover EndpointSlices, so the node user gets kube-proxy's role.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: briglet:node-proxier
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:node-proxier
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+  kind: User
+  name: system:node:{{NODE}}

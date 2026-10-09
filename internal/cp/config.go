@@ -44,6 +44,8 @@ const (
 	SchedulerPort   = 10259
 	KubeletPort     = 10250
 	SAIssuer        = "https://kubernetes.default.svc.cluster.local"
+	// EgressProxyAddr is where the node agent serves the apiserver's
+	// cluster egress CONNECT proxy.
 )
 
 // Paths is the layout of the state directory.

@@ -12,7 +12,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BRIGLET="$ROOT/bin/briglet"
 KUBECTL=${KUBECTL:-kubectl}
-HULL_BIN=${HULL_BIN:-/opt/homebrew/bin/hull}
+export HULL_BIN=${HULL_BIN:-hull}
 STATE=${BRIGLET_STATE_DIR:-$HOME/.briglet}
 GW_API="$STATE/gw.sock.api"
 export KUBECONFIG="$STATE/admin.kubeconfig"
@@ -29,6 +29,12 @@ now() { perl -MTime::HiRes=time -e 'printf "%.2f", time'; }
 since() { perl -e "printf '%.2f', $(now) - $1"; }
 elapsed_over() { perl -e "exit(!($(now) - $1 > $2))"; }
 hull_ps() { "$HULL_BIN" --unattended --dnt --store-dir "$STATE/hull-store" ps; }
+# CoreDNS runs in kube-system on every cluster since services. The checks below
+# count only the VMs, addresses and forwards of the other pods.
+default_vms() { hull_ps | awk 'NR>1 && $1 !~ /^kube-system_/ {print $1}'; }
+default_addrs() {
+	python3 -c 'import json, sys; print(sum(1 for a in json.load(open(sys.argv[1])) if not a["pod"].startswith("kube-system/")))' "$STATE/ipam.json"
+}
 gw() { curl -sS --unix-socket "$GW_API" "$@"; }
 
 # until_true TIMEOUT WHAT CMD...: run CMD every 0.5 s until it succeeds.
@@ -360,12 +366,17 @@ until_true 60 "web pods gone" no_web_pods
 "$KUBECTL" get pods
 ps_out=$(hull_ps)
 echo "hull ps: $ps_out"
-[ "$ps_out" = "No instances found" ] || fail "VMs left after delete"
+[ -z "$(default_vms)" ] || fail "VMs left after delete"
 echo "ipam.json: $(tr -d ' \n' <"$STATE/ipam.json")"
-[ "$(tr -d ' \n' <"$STATE/ipam.json")" = "[]" ] || fail "addresses left allocated"
+[ "$(default_addrs)" = 0 ] || fail "addresses left allocated"
 fw=$(gw http://gateway/forwards | tr -d ' \n')
 echo "GET /forwards: $fw"
-[ "$fw" = "[]" ] || [ "$fw" = null ] || fail "forwards left behind"
+left=$(gw http://gateway/forwards | python3 -c '
+import json, sys
+keep = {a["addr"] for a in json.load(open(sys.argv[1])) if a["pod"].startswith("kube-system/")}
+print(sum(1 for f in (json.load(sys.stdin) or []) if f["remote"].rsplit(":", 1)[0] not in keep))
+' "$STATE/ipam.json")
+[ "$left" = 0 ] || fail "forwards left behind"
 echo "pod dirs: $(ls "$STATE/pods" | wc -l | tr -d ' ')"
 
 step "briglet status"

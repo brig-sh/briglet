@@ -49,6 +49,11 @@ type Component struct {
 	BeforeStart func() error
 	// BeforeStop runs before the process is stopped, whether it runs or not.
 	BeforeStop func(out io.Writer) error
+	// Preflight runs before the start or adoption of the process; pid is 0
+	// when it does not run.
+	Preflight func(pid int) error
+	// AfterReady runs once the process is ready, on every `up`.
+	AfterReady func(ctx context.Context, out io.Writer) error
 }
 
 // Cluster is the full set of components in start order.
@@ -102,13 +107,17 @@ func NewCluster() (*Cluster, error) {
 		"--client-cert-auth=true",
 	)
 	apiserver := NewProc(p, "kube-apiserver", bins.APIServer,
-		fmt.Sprintf("--etcd-servers=https://127.0.0.1:%d", EtcdClientPort),
+		"--etcd-servers="+fmt.Sprintf("https://127.0.0.1:%d", EtcdClientPort),
 		"--etcd-cafile="+pki("ca.crt"),
 		"--etcd-certfile="+pki("apiserver-etcd-client.crt"),
 		"--etcd-keyfile="+pki("apiserver-etcd-client.key"),
 		"--bind-address=0.0.0.0",
 		fmt.Sprintf("--secure-port=%d", APIServerPort),
 		"--advertise-address="+GatewayIP,
+		// Cluster-bound dials, such as admission webhooks and the service
+		// proxy, go through the node agent's CONNECT proxy into the
+		// gateway, where the service table routes them.
+		"--egress-selector-config-file="+filepath.Join(p.Root, "egress-selector.yaml"),
 		"--tls-cert-file="+pki("apiserver.crt"),
 		"--tls-private-key-file="+pki("apiserver.key"),
 		"--client-ca-file="+pki("ca.crt"),
@@ -166,6 +175,7 @@ func NewCluster() (*Cluster, error) {
 		"--api", p.GatewayAPI,
 		"--subnet", ClusterCIDR,
 		"--gateway-ip", GatewayIP,
+		"--service-cidr", ServiceCIDR,
 	)...)
 	gwAPI := hull.NewGateway(p.GatewayAPI)
 	node := NewProc(p, "node", self, "node",
@@ -187,7 +197,7 @@ func NewCluster() (*Cluster, error) {
 		{Proc: apiserver, Port: APIServerPort, Health: func(ctx context.Context) error {
 			_, err := c.get(ctx, fmt.Sprintf("https://127.0.0.1:%d/readyz", APIServerPort), "admin")
 			return err
-		}},
+		}, AfterReady: c.ApplyAddons},
 		{Proc: kcm, Port: KCMPort, Health: func(ctx context.Context) error {
 			_, err := c.get(ctx, fmt.Sprintf("https://127.0.0.1:%d/healthz", KCMPort), "")
 			return err
@@ -196,7 +206,8 @@ func NewCluster() (*Cluster, error) {
 			_, err := c.get(ctx, fmt.Sprintf("https://127.0.0.1:%d/healthz", SchedulerPort), "")
 			return err
 		}},
-		{Proc: gateway, Health: gwAPI.Healthy, BeforeStart: c.clearGatewaySockets, BeforeStop: c.removeInstances},
+		{Proc: gateway, Health: gwAPI.Healthy, BeforeStart: c.clearGatewaySockets, BeforeStop: c.removeInstances,
+			Preflight: c.checkGatewayServices},
 		{Proc: node, Port: KubeletPort, Health: func(ctx context.Context) error {
 			if _, err := c.get(ctx, fmt.Sprintf("https://127.0.0.1:%d/healthz", KubeletPort), "apiserver-kubelet-client"); err != nil {
 				return err
@@ -294,6 +305,18 @@ func (c *Cluster) Up(ctx context.Context, out io.Writer) error {
 	if err := WriteKubeconfigs(c.Paths); err != nil {
 		return err
 	}
+	if err := WriteEgressConfig(filepath.Join(c.Paths.Root, "egress-selector.yaml"), filepath.Join(c.Paths.Root, "egress.sock")); err != nil {
+		return err
+	}
+	// Preflights run before anything starts, so a missing prerequisite
+	// leaves no half-started cluster.
+	for _, comp := range c.Components {
+		if comp.Preflight != nil {
+			if err := comp.Preflight(comp.Pid()); err != nil {
+				return fmt.Errorf("%s: %w", comp.Name, err)
+			}
+		}
+	}
 	for _, comp := range c.Components {
 		start := time.Now()
 		state := "started"
@@ -316,6 +339,11 @@ func (c *Cluster) Up(ctx context.Context, out io.Writer) error {
 			return err
 		}
 		fmt.Fprintf(out, "%-24s ready in %5.2fs (pid %d, %s)\n", comp.Name, time.Since(start).Seconds(), comp.Pid(), state)
+		if comp.AfterReady != nil {
+			if err := comp.AfterReady(ctx, out); err != nil {
+				return fmt.Errorf("%s: %w", comp.Name, err)
+			}
+		}
 	}
 	return nil
 }

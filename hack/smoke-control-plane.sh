@@ -8,6 +8,8 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BRIGLET="$ROOT/bin/briglet"
 KUBECTL=${KUBECTL:-kubectl}
+# briglet up needs a hull whose gateway has --service-cidr.
+export HULL_BIN=${HULL_BIN:-hull}
 STATE=${BRIGLET_STATE_DIR:-$HOME/.briglet}
 PKI="$STATE/pki"
 NODE_KC="$STATE/kubeconfig/node.kubeconfig"

@@ -20,6 +20,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/netip"
+	"path/filepath"
 	"time"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -28,12 +30,14 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/ptr"
 
 	"github.com/brig-sh/briglet/internal/hull"
+	"github.com/brig-sh/briglet/internal/services"
 )
 
 const (
@@ -67,6 +71,14 @@ type Config struct {
 	PodCIDR     string
 	// APIServiceIP is the cluster IP of the `kubernetes` Service.
 	APIServiceIP string
+	// ServiceCIDR is the cluster IP range the gateway routes.
+	ServiceCIDR string
+	// ClusterDNS and ClusterDomain go into the resolv.conf of ClusterFirst
+	// pods.
+	ClusterDNS    string
+	ClusterDomain string
+	// Debug logs the full service table on each change.
+	Debug bool
 }
 
 // Agent is a running node agent.
@@ -95,13 +107,33 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 	h := hull.New(cfg.HullBin, cfg.HullStore)
-	pm, err := newPodManager(cs, cfg, h)
+	shared := informers.NewSharedInformerFactory(cs, 0)
+	pm, err := newPodManager(cs, cfg, h, shared)
+	if err != nil {
+		return err
+	}
+	podCIDR, err := netip.ParsePrefix(cfg.PodCIDR)
+	if err != nil {
+		return fmt.Errorf("pod CIDR: %w", err)
+	}
+	svcCIDR, err := netip.ParsePrefix(cfg.ServiceCIDR)
+	if err != nil {
+		return fmt.Errorf("service CIDR: %w", err)
+	}
+	ss, err := services.New(shared, hull.NewGateway(cfg.GatewaySock+".api"), services.Params{
+		GatewayIP: cfg.HostIP, PodCIDR: podCIDR, ServiceCIDR: svcCIDR,
+	}, cfg.Debug)
 	if err != nil {
 		return err
 	}
 	a := &Agent{cfg: cfg, cs: cs, facts: facts, pods: pm}
 
-	errc := make(chan error, 2)
+	errc := make(chan error, 3)
+	go func() {
+		if err := serveEgressProxy(ctx, filepath.Join(cfg.StateDir, "egress.sock"), hull.NewGateway(cfg.GatewaySock+".api"), svcCIDR, podCIDR); err != nil && ctx.Err() == nil {
+			errc <- fmt.Errorf("egress proxy: %w", err)
+		}
+	}()
 	go func() {
 		if err := serveKubelet(ctx, fmt.Sprintf(":%d", cfg.Port), cfg.TLSCertFile, cfg.TLSKeyFile, cfg.ClientCAFile, cfg.Name, pm); err != nil {
 			errc <- fmt.Errorf("kubelet server: %w", err)
@@ -118,6 +150,11 @@ func Run(ctx context.Context, cfg Config) error {
 	go func() {
 		if err := pm.run(ctx); err != nil && ctx.Err() == nil {
 			errc <- fmt.Errorf("pod sync: %w", err)
+		}
+	}()
+	go func() {
+		if err := ss.Run(ctx); err != nil && ctx.Err() == nil {
+			errc <- fmt.Errorf("service sync: %w", err)
 		}
 	}()
 

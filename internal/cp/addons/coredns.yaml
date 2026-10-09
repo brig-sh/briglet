@@ -1,0 +1,179 @@
+# CoreDNS as kubeadm 1.37 deploys it (cmd/kubeadm/app/phases/addons/dns),
+# with the upstream resolver set to the hull gateway at {{GATEWAY_IP}}.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: coredns
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: system:coredns
+rules:
+- apiGroups: [""]
+  resources: [endpoints, services, pods, namespaces]
+  verbs: [list, watch]
+- apiGroups: [discovery.k8s.io]
+  resources: [endpointslices]
+  verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: system:coredns
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:coredns
+subjects:
+- kind: ServiceAccount
+  name: coredns
+  namespace: kube-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns
+  namespace: kube-system
+data:
+  Corefile: |
+    .:53 {
+        errors
+        health {
+           lameduck 5s
+        }
+        ready
+        kubernetes {{CLUSTER_DOMAIN}} in-addr.arpa ip6.arpa {
+           pods insecure
+           fallthrough in-addr.arpa ip6.arpa
+           ttl 30
+        }
+        prometheus :9153
+        forward . {{GATEWAY_IP}} {
+           max_concurrent 1000
+        }
+        cache 30 {
+           disable success {{CLUSTER_DOMAIN}}
+           disable denial {{CLUSTER_DOMAIN}}
+        }
+        loop
+        reload
+        loadbalance
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coredns
+  namespace: kube-system
+  labels:
+    k8s-app: kube-dns
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      k8s-app: kube-dns
+  template:
+    metadata:
+      labels:
+        k8s-app: kube-dns
+    spec:
+      priorityClassName: system-cluster-critical
+      serviceAccountName: coredns
+      tolerations:
+      - key: CriticalAddonsOnly
+        operator: Exists
+      - key: node-role.kubernetes.io/control-plane
+        effect: NoSchedule
+      nodeSelector:
+        kubernetes.io/os: linux
+      containers:
+      - name: coredns
+        image: {{COREDNS_IMAGE}}
+        imagePullPolicy: IfNotPresent
+        resources:
+          limits:
+            memory: {{COREDNS_MEMORY}}
+          requests:
+            cpu: 100m
+            memory: 70Mi
+        args: ["-conf", "/etc/coredns/Corefile"]
+        volumeMounts:
+        - name: config-volume
+          mountPath: /etc/coredns
+          readOnly: true
+        ports:
+        - containerPort: 53
+          name: dns
+          protocol: UDP
+        - containerPort: 53
+          name: dns-tcp
+          protocol: TCP
+        - containerPort: 9153
+          name: metrics
+          protocol: TCP
+        - containerPort: 8080
+          name: liveness-probe
+          protocol: TCP
+        - containerPort: 8181
+          name: readiness-probe
+          protocol: TCP
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: liveness-probe
+            scheme: HTTP
+          initialDelaySeconds: 60
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 5
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: readiness-probe
+            scheme: HTTP
+      # The CoreDNS pod resolves upstream names through the gateway, so it
+      # keeps the guest's own resolv.conf.
+      dnsPolicy: Default
+      volumes:
+      - name: config-volume
+        configMap:
+          name: coredns
+          items:
+          - key: Corefile
+            path: Corefile
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kube-dns
+  namespace: kube-system
+  labels:
+    k8s-app: kube-dns
+    kubernetes.io/cluster-service: "true"
+    kubernetes.io/name: CoreDNS
+  annotations:
+    prometheus.io/port: "9153"
+    prometheus.io/scrape: "true"
+spec:
+  clusterIP: {{CLUSTER_DNS_IP}}
+  ports:
+  - name: dns
+    port: 53
+    protocol: UDP
+    targetPort: 53
+  - name: dns-tcp
+    port: 53
+    protocol: TCP
+    targetPort: 53
+  - name: metrics
+    port: 9153
+    protocol: TCP
+    targetPort: 9153
+  selector:
+    k8s-app: kube-dns

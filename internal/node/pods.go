@@ -76,16 +76,21 @@ type podManager struct {
 	maxName  int
 	recorder record.EventRecorder
 	lister   corelisters.PodLister
+	// shared is the cluster-wide informer factory the agent shares with
+	// the service table sync.
+	shared informers.SharedInformerFactory
 	// services feeds the Service link variables of new containers.
 	services corelisters.ServiceLister
 	// apiServiceIP is the cluster IP of the `kubernetes` Service, used
 	// for KUBERNETES_SERVICE_HOST until the Service shows up in the
 	// informer.
 	apiServiceIP string
-	gw           *hull.Gateway
-	sources      *sourceWatch
-	src          *apiSources
-	probeClient  *http.Client
+	// dns is what pod resolv.conf files are built from.
+	dns         podvm.DNS
+	gw          *hull.Gateway
+	sources     *sourceWatch
+	src         *apiSources
+	probeClient *http.Client
 	// pullMu serializes image pulls. hull sweeps every staging directory
 	// at the start of a pull, so two concurrent pulls break each other.
 	pullMu sync.Mutex
@@ -95,7 +100,7 @@ type podManager struct {
 	ctx     context.Context
 }
 
-func newPodManager(cs kubernetes.Interface, cfg Config, h *hull.Client) (*podManager, error) {
+func newPodManager(cs kubernetes.Interface, cfg Config, h *hull.Client, shared informers.SharedInformerFactory) (*podManager, error) {
 	ipam, err := podvm.NewIPAM(cfg.IPAMFile, cfg.PodCIDR)
 	if err != nil {
 		return nil, err
@@ -112,6 +117,8 @@ func newPodManager(cs kubernetes.Interface, cfg Config, h *hull.Client) (*podMan
 	}
 	return &podManager{
 		apiServiceIP: apiIP,
+		shared:       shared,
+		dns:          podvm.DNS{ClusterDNS: cfg.ClusterDNS, Domain: cfg.ClusterDomain, Upstream: cfg.HostIP},
 		gw:           hull.NewGateway(cfg.GatewaySock + ".api"),
 		sources:      sw,
 		src:          &apiSources{cs: cs, watch: sw},
@@ -141,13 +148,13 @@ func (m *podManager) run(ctx context.Context) error {
 	inf := pods.Informer()
 	m.lister = pods.Lister()
 	// The Node authorizer lets a node list and watch every Service, as the
-	// kubelet does for the Service link variables.
-	svcFactory := informers.NewSharedInformerFactory(m.cs, 0)
-	svcs := svcFactory.Core().V1().Services()
+	// kubelet does for the Service link variables. The shared factory also
+	// feeds the gateway service table.
+	svcs := m.shared.Core().V1().Services()
 	svcInf := svcs.Informer()
 	m.services = svcs.Lister()
 	factory.Start(ctx.Done())
-	svcFactory.Start(ctx.Done())
+	m.shared.Start(ctx.Done())
 	if !cache.WaitForCacheSync(ctx.Done(), inf.HasSynced, svcInf.HasSynced) {
 		return ctx.Err()
 	}
@@ -708,8 +715,9 @@ func imageID(ref string, img *hull.Image) string {
 }
 
 // setHostname gives the guest the pod's hostname, which Kubernetes expects
-// to equal the pod name, and an /etc/hosts entry for it. It needs a shell
-// in the image; without one the guest keeps hull's defaults.
+// to equal the pod name, an /etc/hosts entry for it, and the resolv.conf of
+// its dnsPolicy. It needs a shell in the image; without one the guest keeps
+// hull's defaults.
 func (w *podWorker) setHostname(ctx context.Context, pod *corev1.Pod, ip string) {
 	name := pod.Name
 	if pod.Spec.Hostname != "" {
@@ -720,13 +728,16 @@ func (w *podWorker) setHostname(ctx context.Context, pod *corev1.Pod, ip string)
 	}
 	// hull's guest /dev has no stdin, stdout, stderr or fd links. A process
 	// that opens /dev/stdout before this runs creates a regular file there;
-	// one that starts later gets the console.
+	// one that starts later gets the console. The resolv.conf rewrite has
+	// the same race: a lookup in the container's first moments still goes
+	// to the gateway resolver hull configured.
 	script := `hostname "$1" && echo "$1" > /etc/hostname && printf '%s\t%s\n' "$2" "$1" >> /etc/hosts
 rc=$?
+if [ -n "$3" ]; then printf '%s' "$3" > /etc/resolv.conf || rc=1; fi
 for n in 0:stdin 1:stdout 2:stderr; do [ -e "/dev/${n#*:}" ] || ln -s "/proc/self/fd/${n%%:*}" "/dev/${n#*:}"; done
 [ -e /dev/fd ] || ln -s /proc/self/fd /dev/fd
 exit $rc`
-	argv := []string{"/bin/sh", "-c", script, "sh", name, ip}
+	argv := []string{"/bin/sh", "-c", script, "sh", name, ip, podvm.ResolvConf(pod, w.m.dns)}
 	deadline := time.Now().Add(hostnameWait)
 	for {
 		var out bytes.Buffer
@@ -738,6 +749,11 @@ exit $rc`
 			return
 		case err == nil:
 			w.logf("set hostname: exit %d: %s (does the image have /bin/sh?)", code, strings.TrimSpace(out.String()))
+			return
+		case strings.Contains(err.Error(), "fork/exec /bin/sh"):
+			// The agent answered: the image has no shell (distroless,
+			// CoreDNS). Retrying cannot help.
+			w.logf("set hostname: the image has no /bin/sh; the guest keeps hull's hostname and resolv.conf")
 			return
 		case time.Now().After(deadline) || ctx.Err() != nil:
 			w.logf("set hostname: %v", err)

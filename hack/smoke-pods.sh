@@ -9,7 +9,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BRIGLET="$ROOT/bin/briglet"
 KUBECTL=${KUBECTL:-kubectl}
-HULL_BIN=${HULL_BIN:-/opt/homebrew/bin/hull}
+export HULL_BIN=${HULL_BIN:-hull}
 STATE=${BRIGLET_STATE_DIR:-$HOME/.briglet}
 PKI="$STATE/pki"
 GW_API="$STATE/gw.sock.api"
@@ -22,6 +22,12 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 step() { printf '\n## %s\n' "$*"; }
 now() { perl -MTime::HiRes=time -e 'printf "%.2f", time'; }
 hull_ps() { "$HULL_BIN" --unattended --dnt --store-dir "$STATE/hull-store" ps; }
+# CoreDNS runs in kube-system on every cluster since services. The checks below
+# count only the VMs, addresses and forwards of the other pods.
+default_vms() { hull_ps | awk 'NR>1 && $1 !~ /^kube-system_/ {print $1}'; }
+default_addrs() {
+	python3 -c 'import json, sys; print(sum(1 for a in json.load(open(sys.argv[1])) if not a["pod"].startswith("kube-system/")))' "$STATE/ipam.json"
+}
 
 # wait_phase POD PHASE TIMEOUT: poll every 0.5 s until the pod reaches PHASE
 # (and, for Running, has a podIP and a running container).
@@ -157,9 +163,9 @@ echo "measured delete wall time: $(perl -e "printf '%.2f', $(now) - $t0")s"
 "$KUBECTL" get pods
 ps_out=$(hull_ps)
 echo "hull ps: $ps_out"
-[ "$ps_out" = "No instances found" ] || fail "VMs left after delete"
+[ -z "$(default_vms)" ] || fail "VMs left after delete"
 echo "ipam.json: $(tr -d ' \n' <"$STATE/ipam.json")"
-[ "$(tr -d ' \n' <"$STATE/ipam.json")" = "[]" ] || fail "addresses left allocated"
+[ "$(default_addrs)" = 0 ] || fail "addresses left allocated"
 
 step "briglet down removes the VMs; up brings the bound pod back"
 t0=$(now)
@@ -187,7 +193,7 @@ hull_ps
 "$KUBECTL" delete pod keep
 ps_out=$(hull_ps)
 echo "hull ps: $ps_out"
-[ "$ps_out" = "No instances found" ] || fail "VMs left after delete"
+[ -z "$(default_vms)" ] || fail "VMs left after delete"
 
 step "briglet status"
 "$BRIGLET" status

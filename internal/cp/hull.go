@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -45,6 +46,27 @@ func resolveHull() (string, error) {
 		return "", fmt.Errorf("hull binary %s not found or not executable (set HULL_BIN)", bin)
 	}
 	return bin, nil
+}
+
+// checkGatewayServices makes sure the gateway routes Service addresses:
+// the hull binary must know --service-cidr, and a gateway that already runs
+// must have been started with it.
+func (c *Cluster) checkGatewayServices(pid int) error {
+	if pid != 0 {
+		out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "args=").Output()
+		if err != nil {
+			return fmt.Errorf("read the running gateway's arguments: %w", err)
+		}
+		if !strings.Contains(string(out), "--service-cidr") {
+			return fmt.Errorf("the running gateway (pid %d) has no --service-cidr; run `briglet down` and `briglet up` with a HULL_BIN that supports it", pid)
+		}
+		return nil
+	}
+	out, _ := exec.Command(c.Hull.Bin, "network-gateway", "--help").CombinedOutput()
+	if !strings.Contains(string(out), "--service-cidr") {
+		return fmt.Errorf("%s network-gateway has no --service-cidr flag, which Services need; set HULL_BIN to a hull built from the gateway services branch", c.Hull.Bin)
+	}
+	return nil
 }
 
 // storeMounted reports whether hull has the store volume mounted.

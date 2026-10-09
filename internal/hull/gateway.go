@@ -143,6 +143,55 @@ func (g *Gateway) ProbeTCP(ctx context.Context, addr string) (bool, error) {
 	}
 }
 
+// ServiceEndpoint is one backend of a gateway service. A host endpoint is
+// dialed from the host, so 127.0.0.1 there is the Mac itself.
+type ServiceEndpoint struct {
+	IP   string `json:"ip"`
+	Port int32  `json:"port"`
+	Host bool   `json:"host,omitempty"`
+}
+
+// Service is one entry of the gateway service table: a virtual address,
+// port and protocol, and the endpoints a connection to it is carried to.
+type Service struct {
+	VIP       string            `json:"vip"`
+	Port      int32             `json:"port"`
+	Protocol  string            `json:"protocol"`
+	Endpoints []ServiceEndpoint `json:"endpoints"`
+}
+
+// Services returns the service table the gateway routes.
+func (g *Gateway) Services(ctx context.Context) ([]Service, error) {
+	body, status, err := g.call(ctx, http.MethodGet, "/services", nil)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, statusErr("list services", body, status)
+	}
+	var out []Service
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("gateway services: %w", err)
+	}
+	return out, nil
+}
+
+// PutServices replaces the whole service table. A table the gateway
+// refuses leaves the installed one in place.
+func (g *Gateway) PutServices(ctx context.Context, table []Service) error {
+	if table == nil {
+		table = []Service{}
+	}
+	body, status, err := g.call(ctx, http.MethodPut, "/services", table)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return statusErr("put services", body, status)
+	}
+	return nil
+}
+
 // Healthy reports whether the API answers.
 func (g *Gateway) Healthy(ctx context.Context) error {
 	_, err := g.Forwards(ctx)

@@ -16,6 +16,7 @@ package cp
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 
 	"k8s.io/client-go/tools/clientcmd"
@@ -23,6 +24,23 @@ import (
 )
 
 const clusterName = "briglet"
+
+// WriteEgressConfig writes the apiserver's egress selector: cluster
+// dials go through the node agent's CONNECT proxy on a unix socket,
+// which carries them into the gateway's pod network.
+func WriteEgressConfig(path, udsName string) error {
+	y := `apiVersion: apiserver.k8s.io/v1beta1
+kind: EgressSelectorConfiguration
+egressSelections:
+- name: cluster
+  connection:
+    proxyProtocol: HTTPConnect
+    transport:
+      uds:
+        udsName: ` + udsName + `
+`
+	return os.WriteFile(path, []byte(y), 0o600)
+}
 
 // APIServerURL is the address host-side clients use.
 func APIServerURL() string {

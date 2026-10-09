@@ -121,7 +121,11 @@ func cmdNode(ctx context.Context, args []string) error {
 		IPAMFile:    p.IPAM,
 		PodCIDR:     cp.ClusterCIDR,
 
-		APIServiceIP: cp.ServiceAPIServerIP,
+		APIServiceIP:  cp.ServiceAPIServerIP,
+		ServiceCIDR:   cp.ServiceCIDR,
+		ClusterDNS:    cp.ClusterDNSIP,
+		ClusterDomain: cp.ClusterDomain,
+		Debug:         os.Getenv("BRIGLET_DEBUG") != "",
 	}
 	fs := flag.NewFlagSet("node", flag.ExitOnError)
 	fs.StringVar(&cfg.Kubeconfig, "kubeconfig", p.Kubeconfig("node"), "kubeconfig with the node's client credentials")
