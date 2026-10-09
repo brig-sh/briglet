@@ -23,6 +23,8 @@ import (
 	"strings"
 
 	"k8s.io/apimachinery/pkg/util/validation"
+
+	"github.com/brig-sh/briglet/internal/hull"
 )
 
 // Network facts shared by the control plane and the node agent.
@@ -31,14 +33,17 @@ const (
 	ClusterCIDR        = "10.87.0.0/24"
 	ServiceCIDR        = "10.96.0.0/12"
 	ServiceAPIServerIP = "10.96.0.1"
-	APIServerPort      = 6443
-	EtcdClientPort     = 2379
-	EtcdPeerPort       = 2380
-	EtcdMetricsPort    = 2381
-	KCMPort            = 10257
-	SchedulerPort      = 10259
-	KubeletPort        = 10250
-	SAIssuer           = "https://kubernetes.default.svc.cluster.local"
+	// NodeIP is the node's InternalIP: the address the apiserver dials for
+	// logs and exec. Loopback works offline. Pods reach the host at GatewayIP.
+	NodeIP          = "127.0.0.1"
+	APIServerPort   = 6443
+	EtcdClientPort  = 2379
+	EtcdPeerPort    = 2380
+	EtcdMetricsPort = 2381
+	KCMPort         = 10257
+	SchedulerPort   = 10259
+	KubeletPort     = 10250
+	SAIssuer        = "https://kubernetes.default.svc.cluster.local"
 )
 
 // Paths is the layout of the state directory.
@@ -50,6 +55,18 @@ type Paths struct {
 	Run             string
 	Kubeconfigs     string
 	AdminKubeconfig string
+	// HullStore is hull's --store-dir. hull mounts a case-sensitive APFS
+	// image there, backed by HullStore + ".sparseimage".
+	HullStore string
+	// GatewaySock is the gateway control socket. hull derives the QEMU
+	// stream socket (+".qemu", used by hvi) and `hull run` derives the API
+	// socket (+".api") from it.
+	GatewaySock string
+	GatewayAPI  string
+	// Pods holds one directory per pod UID with the agent's record of it.
+	Pods string
+	// IPAM is the pod address allocation file.
+	IPAM string
 }
 
 // StateDir returns the briglet state directory: $BRIGLET_STATE_DIR or ~/.briglet.
@@ -78,12 +95,17 @@ func NewPaths() (Paths, error) {
 		Run:             filepath.Join(root, "run"),
 		Kubeconfigs:     filepath.Join(root, "kubeconfig"),
 		AdminKubeconfig: filepath.Join(root, "admin.kubeconfig"),
+		HullStore:       filepath.Join(root, "hull-store"),
+		GatewaySock:     filepath.Join(root, "gw.sock"),
+		GatewayAPI:      filepath.Join(root, "gw.sock.api"),
+		Pods:            filepath.Join(root, "pods"),
+		IPAM:            filepath.Join(root, "ipam.json"),
 	}, nil
 }
 
 // Mkdirs creates the state directory tree with owner-only permissions.
 func (p Paths) Mkdirs() error {
-	for _, d := range []string{p.Root, p.PKI, p.Etcd, p.Logs, p.Run, p.Kubeconfigs} {
+	for _, d := range []string{p.Root, p.PKI, p.Etcd, p.Logs, p.Run, p.Kubeconfigs, p.Pods} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return err
 		}
@@ -120,6 +142,13 @@ func BinDir() (string, error) {
 		return "", err
 	}
 	return filepath.Join(home, ".local", "share", "briglet", "bin"), nil
+}
+
+// HullBin returns the hull binary to run, resolved the way hull.Bin does
+// against BinDir.
+func HullBin() string {
+	dir, _ := BinDir()
+	return hull.Bin(dir)
 }
 
 // ResolveBinaries locates etcd, kube-apiserver, kube-controller-manager

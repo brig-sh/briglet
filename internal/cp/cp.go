@@ -33,6 +33,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
+
+	"github.com/brig-sh/briglet/internal/hull"
 )
 
 const readyTimeout = 90 * time.Second
@@ -43,12 +45,17 @@ type Component struct {
 	Port int
 	// Health probes the component once; nil means ready.
 	Health func(ctx context.Context) error
+	// BeforeStart runs before the process starts, when it is not running.
+	BeforeStart func() error
+	// BeforeStop runs before the process is stopped, whether it runs or not.
+	BeforeStop func(out io.Writer) error
 }
 
 // Cluster is the full set of components in start order.
 type Cluster struct {
 	Paths      Paths
 	NodeName   string
+	Hull       *hull.Client
 	Components []*Component
 }
 
@@ -73,8 +80,12 @@ func NewCluster() (*Cluster, error) {
 	if self, err = filepath.EvalSymlinks(self); err != nil {
 		return nil, err
 	}
+	hullBin, err := resolveHull()
+	if err != nil {
+		return nil, err
+	}
 	pki := func(f string) string { return filepath.Join(p.PKI, f) }
-	c := &Cluster{Paths: p, NodeName: name}
+	c := &Cluster{Paths: p, NodeName: name, Hull: hull.New(hullBin, p.HullStore)}
 
 	etcd := NewProc(p, "etcd", bins.Etcd,
 		"--name=briglet",
@@ -111,9 +122,10 @@ func NewCluster() (*Cluster, error) {
 		"--kubelet-client-certificate="+pki("apiserver-kubelet-client.crt"),
 		"--kubelet-client-key="+pki("apiserver-kubelet-client.key"),
 		"--kubelet-certificate-authority="+pki("ca.crt"),
-		// 10.87.0.1 lives inside the hull gateway netstack, not on a host
-		// interface, so the apiserver reaches the agent by hostname.
-		"--kubelet-preferred-address-types=Hostname,InternalIP",
+		// The node's InternalIP is 127.0.0.1, so logs and exec work without
+		// the LAN. 10.87.0.1 lives inside the hull gateway netstack, not on
+		// a host interface.
+		"--kubelet-preferred-address-types=InternalIP",
 	)
 	kcmKC := p.Kubeconfig("controller-manager")
 	kcm := NewProc(p, "kube-controller-manager", bins.ControllerManager,
@@ -149,6 +161,13 @@ func NewCluster() (*Cluster, error) {
 		"--tls-private-key-file="+pki("scheduler-serving.key"),
 		"--leader-elect=false",
 	)
+	gateway := NewProc(p, "gateway", hullBin, append(c.Hull.GlobalArgs(), "network-gateway",
+		"--socket", p.GatewaySock,
+		"--api", p.GatewayAPI,
+		"--subnet", ClusterCIDR,
+		"--gateway-ip", GatewayIP,
+	)...)
+	gwAPI := hull.NewGateway(p.GatewayAPI)
 	node := NewProc(p, "node", self, "node",
 		"--kubeconfig="+p.Kubeconfig("node"),
 		"--name="+name,
@@ -177,6 +196,7 @@ func NewCluster() (*Cluster, error) {
 			_, err := c.get(ctx, fmt.Sprintf("https://127.0.0.1:%d/healthz", SchedulerPort), "")
 			return err
 		}},
+		{Proc: gateway, Health: gwAPI.Healthy, BeforeStart: c.clearGatewaySockets, BeforeStop: c.removeInstances},
 		{Proc: node, Port: KubeletPort, Health: func(ctx context.Context) error {
 			if _, err := c.get(ctx, fmt.Sprintf("https://127.0.0.1:%d/healthz", KubeletPort), "apiserver-kubelet-client"); err != nil {
 				return err
@@ -280,8 +300,13 @@ func (c *Cluster) Up(ctx context.Context, out io.Writer) error {
 		if comp.Pid() != 0 {
 			state = "already running"
 		} else {
-			if portInUse(comp.Port) {
+			if comp.Port != 0 && portInUse(comp.Port) {
 				return fmt.Errorf("%s: port %d is in use by a process briglet did not start", comp.Name, comp.Port)
+			}
+			if comp.BeforeStart != nil {
+				if err := comp.BeforeStart(); err != nil {
+					return fmt.Errorf("%s: %w", comp.Name, err)
+				}
 			}
 			if err := comp.Start(); err != nil {
 				return err
@@ -322,6 +347,12 @@ func (c *Cluster) Down(out io.Writer, wipe bool) error {
 	var errs []error
 	for i := len(c.Components) - 1; i >= 0; i-- {
 		comp := c.Components[i]
+		if comp.BeforeStop != nil {
+			if err := comp.BeforeStop(out); err != nil {
+				errs = append(errs, err)
+				continue
+			}
+		}
 		pid := comp.Pid()
 		stopped, err := comp.Stop(15 * time.Second)
 		switch {
@@ -339,6 +370,9 @@ func (c *Cluster) Down(out io.Writer, wipe bool) error {
 	if wipe {
 		if filepath.Base(c.Paths.Root) != ".briglet" && os.Getenv("BRIGLET_STATE_DIR") == "" {
 			return fmt.Errorf("refusing to wipe unexpected state dir %s", c.Paths.Root)
+		}
+		if err := c.detachStore(out); err != nil {
+			return err
 		}
 		if err := os.RemoveAll(c.Paths.Root); err != nil {
 			return err

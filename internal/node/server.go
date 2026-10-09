@@ -22,6 +22,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -30,11 +31,19 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// apiserverClientCN is the subject of the client cert the apiserver uses
+// for logs and exec. Only it may call the endpoints that reach into pods.
+const apiserverClientCN = "kube-apiserver-kubelet-client"
+
 // serveKubelet runs the kubelet HTTPS endpoint. Every client must present a
-// certificate signed by the cluster CA.
-func serveKubelet(ctx context.Context, addr, certFile, keyFile, clientCAFile, nodeName string) error {
+// certificate signed by the cluster CA; the pod endpoints further require
+// the apiserver's kubelet client identity.
+func serveKubelet(ctx context.Context, addr, certFile, keyFile, clientCAFile, nodeName string, pm *podManager) error {
 	caPEM, err := os.ReadFile(clientCAFile)
 	if err != nil {
 		return fmt.Errorf("client CA: %w", err)
@@ -51,11 +60,13 @@ func serveKubelet(ctx context.Context, addr, certFile, keyFile, clientCAFile, no
 	if err != nil {
 		return fmt.Errorf("serving cert: %w", err)
 	}
+	s := &kubeletServer{pm: pm}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("ok"))
 	})
+	mux.Handle("GET /pods", apiserverOnly(http.HandlerFunc(s.pods)))
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
@@ -83,6 +94,38 @@ func serveKubelet(ctx context.Context, addr, certFile, keyFile, clientCAFile, no
 		return err
 	}
 	return nil
+}
+
+// apiserverOnly rejects every client cert but the apiserver's kubelet
+// client. The real kubelet asks the apiserver with a SubjectAccessReview;
+// on a one-node cluster whose CA also signs the admin, controller and node
+// certs, a fixed subject is the simpler rule.
+func apiserverOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 || r.TLS.PeerCertificates[0].Subject.CommonName != apiserverClientCN {
+			cn := ""
+			if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+				cn = r.TLS.PeerCertificates[0].Subject.CommonName
+			}
+			log.Printf("kubelet server: forbidden %s %s for %q", r.Method, r.URL.Path, cn)
+			http.Error(w, fmt.Sprintf("Forbidden (user=%s, path=%s)", cn, r.URL.Path), http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+type kubeletServer struct {
+	pm *podManager
+}
+
+func (s *kubeletServer) pods(w http.ResponseWriter, _ *http.Request) {
+	list := corev1.PodList{
+		TypeMeta: metav1.TypeMeta{Kind: "PodList", APIVersion: "v1"},
+		Items:    s.pm.boundPods(),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(&list)
 }
 
 func selfSigned(nodeName string) (tls.Certificate, error) {

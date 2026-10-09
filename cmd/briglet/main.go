@@ -111,15 +111,20 @@ func cmdNode(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	hull := os.Getenv("HULL_BIN")
-	if hull == "" {
-		hull = "/opt/homebrew/bin/hull"
+	cfg := node.Config{
+		StateDir:    p.Root,
+		HullBin:     cp.HullBin(),
+		HostIP:      cp.GatewayIP,
+		HullStore:   p.HullStore,
+		GatewaySock: p.GatewaySock,
+		PodsDir:     p.Pods,
+		IPAMFile:    p.IPAM,
+		PodCIDR:     cp.ClusterCIDR,
 	}
-	cfg := node.Config{StateDir: p.Root, HullBin: hull}
 	fs := flag.NewFlagSet("node", flag.ExitOnError)
 	fs.StringVar(&cfg.Kubeconfig, "kubeconfig", p.Kubeconfig("node"), "kubeconfig with the node's client credentials")
 	fs.StringVar(&cfg.Name, "name", name, "Node name")
-	fs.StringVar(&cfg.NodeIP, "node-ip", cp.GatewayIP, "InternalIP reported for the node")
+	fs.StringVar(&cfg.NodeIP, "node-ip", cp.NodeIP, "InternalIP reported for the node; the apiserver dials it for logs and exec")
 	fs.IntVar(&cfg.Port, "port", cp.KubeletPort, "kubelet HTTPS port")
 	fs.StringVar(&cfg.TLSCertFile, "tls-cert-file", filepath.Join(p.PKI, "kubelet-serving.crt"), "kubelet serving cert")
 	fs.StringVar(&cfg.TLSKeyFile, "tls-private-key-file", filepath.Join(p.PKI, "kubelet-serving.key"), "kubelet serving key")

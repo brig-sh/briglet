@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net"
 	"time"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -33,6 +32,8 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/ptr"
+
+	"github.com/brig-sh/briglet/internal/hull"
 )
 
 const (
@@ -56,6 +57,14 @@ type Config struct {
 	ClientCAFile string
 	StateDir     string
 	HullBin      string
+	// HostIP is reported as the pods' hostIP: the gateway address, which is
+	// how a pod reaches the host.
+	HostIP      string
+	HullStore   string
+	GatewaySock string
+	PodsDir     string
+	IPAMFile    string
+	PodCIDR     string
 }
 
 // Agent is a running node agent.
@@ -64,6 +73,7 @@ type Agent struct {
 	cs    kubernetes.Interface
 	facts HostFacts
 	uid   string
+	pods  *podManager
 }
 
 // Run registers the node and blocks until ctx is done or a loop fails.
@@ -82,12 +92,18 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	a := &Agent{cfg: cfg, cs: cs, facts: facts}
-	checkHostnameResolves(cfg.Name)
+	h := hull.New(cfg.HullBin, cfg.HullStore)
+	pm, err := newPodManager(cs, cfg, h)
+	if err != nil {
+		return err
+	}
+	a := &Agent{cfg: cfg, cs: cs, facts: facts, pods: pm}
 
-	errc := make(chan error, 1)
+	errc := make(chan error, 2)
 	go func() {
-		errc <- serveKubelet(ctx, fmt.Sprintf(":%d", cfg.Port), cfg.TLSCertFile, cfg.TLSKeyFile, cfg.ClientCAFile, cfg.Name)
+		if err := serveKubelet(ctx, fmt.Sprintf(":%d", cfg.Port), cfg.TLSCertFile, cfg.TLSKeyFile, cfg.ClientCAFile, cfg.Name, pm); err != nil {
+			errc <- fmt.Errorf("kubelet server: %w", err)
+		}
 	}()
 
 	if err := retryUntil(ctx, "register node", a.register); err != nil {
@@ -97,12 +113,17 @@ func Run(ctx context.Context, cfg Config) error {
 
 	go a.loop(ctx, "lease", renewInterval, a.renewLease)
 	go a.loop(ctx, "status", statusInterval, a.updateStatus)
+	go func() {
+		if err := pm.run(ctx); err != nil && ctx.Err() == nil {
+			errc <- fmt.Errorf("pod sync: %w", err)
+		}
+	}()
 
 	select {
 	case <-ctx.Done():
 		return nil
 	case err := <-errc:
-		return fmt.Errorf("kubelet server: %w", err)
+		return err
 	}
 }
 
@@ -171,6 +192,9 @@ func (a *Agent) fillStatus(st *corev1.NodeStatus) {
 		{Type: corev1.NodeInternalIP, Address: a.cfg.NodeIP},
 		{Type: corev1.NodeHostName, Address: a.cfg.Name},
 	}
+	// The apiserver proxies kubectl's exec websocket to the agent as is
+	// when the node declares this; otherwise it translates it to SPDY.
+	st.DeclaredFeatures = []string{"ExtendWebSocketsToKubelet"}
 	st.DaemonEndpoints.KubeletEndpoint.Port = int32(a.cfg.Port)
 	st.NodeInfo = corev1.NodeSystemInfo{
 		MachineID:               a.facts.SystemUUID,
@@ -283,15 +307,4 @@ func (a *Agent) renewLease(ctx context.Context) error {
 	l.Spec.RenewTime = &now
 	_, err = leases.Update(ctx, l, metav1.UpdateOptions{})
 	return err
-}
-
-// checkHostnameResolves warns when the apiserver cannot reach the agent by
-// name, which breaks apiserver-to-node calls such as logs and exec.
-func checkHostnameResolves(name string) {
-	addrs, err := net.LookupHost(name)
-	if err != nil || len(addrs) == 0 {
-		log.Printf("warning: hostname %q does not resolve (%v); apiserver-to-node calls will fail", name, err)
-		return
-	}
-	log.Printf("hostname %q resolves to %v", name, addrs)
 }
