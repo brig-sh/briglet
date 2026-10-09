@@ -65,24 +65,6 @@ func TestResources(t *testing.T) {
 	}
 }
 
-func TestEnv(t *testing.T) {
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "ns", UID: "u-1"}}
-	c := &corev1.Container{Env: []corev1.EnvVar{
-		{Name: "PATH", Value: "/x:$(PATH)"},
-		{Name: "IP", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIP"}}},
-		{Name: "NS", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}},
-	}}
-	got, err := Env(pod, c, &hull.ImageConfig{Env: []string{"PATH=/bin"}}, FieldValues{PodIP: "10.87.0.10"})
-	want := []string{"HOSTNAME=web", "PATH=/x:/bin", "IP=10.87.0.10", "NS=ns"}
-	if err != nil || !reflect.DeepEqual(got, want) {
-		t.Errorf("Env = %q, %v; want %q", got, err, want)
-	}
-	c.Env = []corev1.EnvVar{{Name: "S", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "k"}}}}
-	if _, err := Env(pod, c, &hull.ImageConfig{}, FieldValues{}); err == nil {
-		t.Error("secretKeyRef: want an error")
-	}
-}
-
 func TestInstanceName(t *testing.T) {
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "default", UID: "1234abcd-5678"}}
 	if got := InstanceName(pod, 48); got != "default_web_1234abcd" {

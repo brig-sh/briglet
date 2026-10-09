@@ -130,7 +130,29 @@ type RunSpec struct {
 	GatewayCIDR string
 	StopGrace   int
 	Env         []string // KEY=VALUE
-	Argv        []string // full guest argv; empty keeps the image default
+	// SecretEnv values travel in hull's own environment and are named on
+	// the command line by key only, so `ps` does not show them.
+	SecretEnv []string // KEY=VALUE
+	Shares    []Share
+	Argv      []string // full guest argv; empty keeps the image default
+}
+
+// Share is a host directory hull exports to the guest over virtio-fs. The
+// guest init creates Guest and mounts the share there before the command
+// starts.
+type Share struct {
+	Host     string
+	Guest    string
+	ReadOnly bool
+}
+
+// Arg renders the share as a --shared-dir value.
+func (s Share) Arg() string {
+	mode := "rw"
+	if s.ReadOnly {
+		mode = "ro"
+	}
+	return s.Host + ":" + s.Guest + ":" + mode
 }
 
 // RunArgs builds the run command line, without the global flags.
@@ -151,6 +173,13 @@ func RunArgs(s RunSpec) []string {
 	for _, kv := range s.Env {
 		args = append(args, "--env", kv)
 	}
+	for _, kv := range s.SecretEnv {
+		k, _, _ := strings.Cut(kv, "=")
+		args = append(args, "--env", k)
+	}
+	for _, sh := range s.Shares {
+		args = append(args, "--shared-dir", sh.Arg())
+	}
 	// hull's flag parser reads flags after the image unless a -- ends them.
 	args = append(args, "--", s.Image)
 	return append(args, s.Argv...)
@@ -159,11 +188,18 @@ func RunArgs(s RunSpec) []string {
 // Run boots an instance and waits until the guest holds its address. It
 // returns the instance id hull prints.
 func (c *Client) Run(ctx context.Context, s RunSpec) (string, error) {
-	out, err := c.output(ctx, RunArgs(s)...)
-	if err != nil {
-		return "", err
+	args := RunArgs(s)
+	cmd := c.command(ctx, args...)
+	if len(s.SecretEnv) > 0 {
+		// exec dedups the environment keeping the last value of a key.
+		cmd.Env = append(os.Environ(), s.SecretEnv...)
 	}
-	return strings.TrimSpace(string(out)), nil
+	var out, errb bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	if err := cmd.Run(); err != nil {
+		return "", wrapErr(args, err, errb.String())
+	}
+	return strings.TrimSpace(out.String()), nil
 }
 
 // Instance is the subset of `hull inspect` briglet reads.

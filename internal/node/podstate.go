@@ -48,11 +48,55 @@ type podState struct {
 	// Rejected holds why the pod cannot run on briglet.
 	Rejected string `json:"rejected,omitempty"`
 
+	// Started is set once the startup probe passed, or at start without
+	// one. Ready is the readiness the probes give the running container.
+	Started bool `json:"started,omitempty"`
+	Ready   bool `json:"ready,omitempty"`
+	// Probes holds the last result and the consecutive counts of each
+	// probe of the running container, keyed by kind, so an agent restart
+	// does not reset them.
+	Probes map[string]*probeState `json:"probes,omitempty"`
+	// Forwards maps a container port to the 127.0.0.1 address the gateway
+	// forwards to it. httpGet probes use them.
+	Forwards map[string]string `json:"forwards,omitempty"`
+	// TokenRefreshAt is when the next service account token in a volume is
+	// due. Zero when no volume holds one.
+	TokenRefreshAt time.Time `json:"tokenRefreshAt,omitempty"`
+
 	Waiting  *waitingState `json:"waiting,omitempty"`
 	LastTerm *termState    `json:"lastTerm,omitempty"`
 	// Term is the current terminated state of a container that will not
 	// restart (Done) or waits for a restart (back-off).
 	Term *termState `json:"term,omitempty"`
+}
+
+type probeState struct {
+	Successes int32     `json:"successes"`
+	Failures  int32     `json:"failures"`
+	Result    string    `json:"result,omitempty"` // success or failure
+	Message   string    `json:"message,omitempty"`
+	LastAt    time.Time `json:"lastAt"`
+}
+
+// clone copies the state deeply enough for a reader outside the worker.
+func (st podState) clone() podState {
+	st.Env = append([]string(nil), st.Env...)
+	if st.Probes != nil {
+		probes := make(map[string]*probeState, len(st.Probes))
+		for k, v := range st.Probes {
+			c := *v
+			probes[k] = &c
+		}
+		st.Probes = probes
+	}
+	if st.Forwards != nil {
+		fw := make(map[string]string, len(st.Forwards))
+		for k, v := range st.Forwards {
+			fw[k] = v
+		}
+		st.Forwards = fw
+	}
+	return st
 }
 
 type waitingState struct {

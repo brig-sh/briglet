@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -75,6 +76,19 @@ type podManager struct {
 	maxName  int
 	recorder record.EventRecorder
 	lister   corelisters.PodLister
+	// services feeds the Service link variables of new containers.
+	services corelisters.ServiceLister
+	// apiServiceIP is the cluster IP of the `kubernetes` Service, used
+	// for KUBERNETES_SERVICE_HOST until the Service shows up in the
+	// informer.
+	apiServiceIP string
+	gw           *hull.Gateway
+	sources      *sourceWatch
+	src          *apiSources
+	probeClient  *http.Client
+	// pullMu serializes image pulls. hull sweeps every staging directory
+	// at the start of a pull, so two concurrent pulls break each other.
+	pullMu sync.Mutex
 
 	mu      sync.Mutex
 	workers map[types.UID]*podWorker
@@ -91,17 +105,27 @@ func newPodManager(cs kubernetes.Interface, cfg Config, h *hull.Client) (*podMan
 	// sockaddr_un holds 104 bytes with the NUL; hull puts agent.sock in the
 	// instance directory.
 	maxName := 103 - len(filepath.Join(h.StoreDir, "instances")) - 1 - len("/agent.sock")
+	sw := newSourceWatch(cs)
+	apiIP := cfg.APIServiceIP
+	if apiIP == "" {
+		apiIP = "10.96.0.1"
+	}
 	return &podManager{
-		cs:       cs,
-		node:     cfg.Name,
-		hostIP:   cfg.HostIP,
-		hull:     h,
-		ipam:     ipam,
-		podsDir:  cfg.PodsDir,
-		gwSock:   cfg.GatewaySock,
-		maxName:  maxName,
-		recorder: b.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "kubelet", Host: cfg.Name}),
-		workers:  map[types.UID]*podWorker{},
+		apiServiceIP: apiIP,
+		gw:           hull.NewGateway(cfg.GatewaySock + ".api"),
+		sources:      sw,
+		src:          &apiSources{cs: cs, watch: sw},
+		probeClient:  newProbeClient(),
+		cs:           cs,
+		node:         cfg.Name,
+		hostIP:       cfg.HostIP,
+		hull:         h,
+		ipam:         ipam,
+		podsDir:      cfg.PodsDir,
+		gwSock:       cfg.GatewaySock,
+		maxName:      maxName,
+		recorder:     b.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "kubelet", Host: cfg.Name}),
+		workers:      map[types.UID]*podWorker{},
 	}, nil
 }
 
@@ -116,8 +140,15 @@ func (m *podManager) run(ctx context.Context) error {
 	pods := factory.Core().V1().Pods()
 	inf := pods.Informer()
 	m.lister = pods.Lister()
+	// The Node authorizer lets a node list and watch every Service, as the
+	// kubelet does for the Service link variables.
+	svcFactory := informers.NewSharedInformerFactory(m.cs, 0)
+	svcs := svcFactory.Core().V1().Services()
+	svcInf := svcs.Informer()
+	m.services = svcs.Lister()
 	factory.Start(ctx.Done())
-	if !cache.WaitForCacheSync(ctx.Done(), inf.HasSynced) {
+	svcFactory.Start(ctx.Done())
+	if !cache.WaitForCacheSync(ctx.Done(), inf.HasSynced, svcInf.HasSynced) {
 		return ctx.Err()
 	}
 	m.reconcile(ctx)
@@ -171,9 +202,36 @@ func (m *podManager) reconcile(ctx context.Context) {
 	entries, _ := os.ReadDir(m.podsDir)
 	for _, e := range entries {
 		if e.IsDir() && !uids[e.Name()] {
+			if st, err := loadPodState(m.podsDir, e.Name()); err == nil && st != nil {
+				removeForwards(ctx, m.gw, st)
+			}
 			_ = os.RemoveAll(filepath.Join(m.podsDir, e.Name()))
 		}
 	}
+}
+
+// serviceEnv returns the Service link variables for a container of the pod
+// that starts now.
+func (m *podManager) serviceEnv(pod *corev1.Pod) []podvm.EnvVar {
+	var svcs []*corev1.Service
+	if m.services != nil {
+		svcs, _ = m.services.List(labels.Everything())
+	}
+	have := false
+	for _, s := range svcs {
+		if s.Namespace == "default" && s.Name == "kubernetes" {
+			have = true
+		}
+	}
+	if !have {
+		svcs = append(svcs, &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "kubernetes"},
+			Spec: corev1.ServiceSpec{ClusterIP: m.apiServiceIP, Ports: []corev1.ServicePort{
+				{Name: "https", Port: 443, Protocol: corev1.ProtocolTCP},
+			}},
+		})
+	}
+	return podvm.ServiceEnv(pod, svcs)
 }
 
 func (m *podManager) onPod(obj any) {
@@ -250,10 +308,16 @@ type podWorker struct {
 	name string
 	wake chan struct{}
 
-	mu   sync.Mutex
-	pod  *corev1.Pod
-	gone bool
-	st   podState
+	// Owned by the worker goroutine.
+	injectSA  bool // the agent adds the service account token volume
+	decidedSA bool
+	lastMeta  string // labels and annotations the volumes were written for
+
+	mu           sync.Mutex
+	pod          *corev1.Pod
+	gone         bool
+	st           podState
+	volumesDirty bool
 }
 
 func newPodWorker(m *podManager, pod *corev1.Pod) *podWorker {
@@ -287,16 +351,14 @@ func (w *podWorker) stopping() bool {
 func (w *podWorker) snapshot() podState {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	st := w.st
-	st.Env = append([]string(nil), w.st.Env...)
-	return st
+	return w.st.clone()
 }
 
 // set applies f to the state under the lock and persists it.
 func (w *podWorker) set(f func(st *podState)) {
 	w.mu.Lock()
 	f(&w.st)
-	st := w.st
+	st := w.st.clone()
 	w.mu.Unlock()
 	if err := savePodState(w.m.podsDir, &st); err != nil {
 		log.Printf("pod %s/%s: save state: %v", w.ns, w.name, err)
@@ -331,6 +393,20 @@ func (w *podWorker) sleep(ctx context.Context, d time.Duration) bool {
 	}
 }
 
+// nap waits for d, any wake-up, or the end of ctx. It reports whether the
+// pod started stopping.
+func (w *podWorker) nap(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return true
+	case <-t.C:
+	case <-w.wake:
+	}
+	return w.stopping()
+}
+
 func (w *podWorker) loop(ctx context.Context) {
 	defer w.m.forget(w)
 	pod, _ := w.current()
@@ -347,6 +423,9 @@ func (w *podWorker) loop(ctx context.Context) {
 				w.event(corev1.EventTypeWarning, podvm.ReasonUnsupported, "%s", msg)
 			}
 		}
+	}
+	if st := w.snapshot(); st.Running && !st.Done {
+		w.adopt(ctx)
 	}
 	w.syncStatus(ctx)
 
@@ -412,6 +491,16 @@ func (w *podWorker) loop(ctx context.Context) {
 	}
 }
 
+// adopt picks up a container that runs from before an agent restart: the
+// volume subscriptions and the gateway forwards. The volumes are rewritten
+// on the first turn of watch.
+func (w *podWorker) adopt(ctx context.Context) {
+	pod, _ := w.current()
+	pod = w.effectivePod(ctx, pod)
+	w.m.sources.Set(w.uid, volumeKeys(pod), w.volumesChanged)
+	w.ensureForwards(ctx, &pod.Spec.Containers[0])
+}
+
 // init loads the persisted state or starts a fresh one, and decides what a
 // restarted agent does with a pod it already knew.
 func (w *podWorker) init(ctx context.Context, pod *corev1.Pod) {
@@ -446,10 +535,11 @@ func (w *podWorker) init(ctx context.Context, pod *corev1.Pod) {
 	w.mu.Unlock()
 }
 
-// start boots the pod's VM: address, image, argv and env, hull run, then the
-// hostname.
+// start boots the pod's VM: address, image, volumes, env and argv, hull
+// run, then the hostname and the gateway forwards.
 func (w *podWorker) start(ctx context.Context) error {
 	pod, _ := w.current()
+	pod = w.effectivePod(ctx, pod)
 	c := &pod.Spec.Containers[0]
 	h := w.m.hull
 	st := w.snapshot()
@@ -457,12 +547,26 @@ func (w *podWorker) start(ctx context.Context) error {
 	waiting := func(reason, msg string) {
 		w.set(func(st *podState) { st.Waiting = &waitingState{Reason: reason, Message: msg} })
 	}
+	configErr := func(err error) error {
+		waiting("CreateContainerConfigError", err.Error())
+		w.event(corev1.EventTypeWarning, "Failed", "Error: %v", err)
+		return err
+	}
 	ip, err := w.m.ipam.Allocate(string(pod.UID), pod.Namespace+"/"+pod.Name)
 	if err != nil {
 		waiting("CreateContainerError", err.Error())
 		return err
 	}
 	w.set(func(st *podState) { st.IP = ip })
+
+	// Volumes come first, as in the kubelet: a pod whose ConfigMap is
+	// missing stays ContainerCreating with FailedMount events.
+	if err := w.writeVolumes(ctx, pod); err != nil {
+		waiting("ContainerCreating", err.Error())
+		w.event(corev1.EventTypeWarning, "FailedMount", "%v", err)
+		return err
+	}
+	w.lastMeta = metaKey(pod)
 
 	img, err := w.ensureImage(ctx, c)
 	if err != nil {
@@ -473,23 +577,31 @@ func (w *podWorker) start(ctx context.Context) error {
 		waiting("CreateContainerConfigError", err.Error())
 		return err
 	}
-	env, err := podvm.Env(pod, c, cfg, podvm.FieldValues{PodIP: ip, NodeName: w.m.node})
+	env, err := podvm.Env(ctx, podvm.EnvInput{
+		Pod: pod, Container: c, Image: cfg, Facts: w.facts(pod),
+		Services: w.m.serviceEnv(pod), Src: w.m.src,
+	})
 	if err != nil {
-		waiting("CreateContainerConfigError", err.Error())
-		w.event(corev1.EventTypeWarning, "Failed", "Error: %v", err)
-		return err
+		return configErr(err)
 	}
-	argv, err := podvm.Argv(c, cfg, env)
+	pairs := podvm.Pairs(env)
+	argv, err := podvm.Argv(c, cfg, pairs)
 	if err != nil {
-		waiting("CreateContainerConfigError", err.Error())
-		w.event(corev1.EventTypeWarning, "Failed", "Error: %v", err)
-		return err
+		return configErr(err)
+	}
+	plain, secret, err := podvm.HullEnv(env)
+	if err != nil {
+		return configErr(err)
 	}
 	cpus, mem := podvm.Resources(c)
 
 	// No restart in hull: a previous VM under the name is removed first.
 	if err := h.Rm(ctx, st.Instance, true); err != nil && !errors.Is(err, hull.ErrNotFound) {
 		w.logf("rm stale %s: %v", st.Instance, err)
+	}
+	shares, err := podvm.Shares(pod, c, w.podDirs(), env)
+	if err != nil {
+		return configErr(err)
 	}
 	spec := hull.RunSpec{
 		Name:        st.Instance,
@@ -500,10 +612,17 @@ func (w *podWorker) start(ctx context.Context) error {
 		GatewaySock: w.m.gwSock,
 		GatewayCIDR: fmt.Sprintf("%s/%d", ip, w.m.ipam.Bits()),
 		StopGrace:   podvm.GraceSeconds(pod),
-		Env:         env,
+		Env:         plain,
+		SecretEnv:   secret,
+		Shares:      shares,
 		Argv:        argv,
 	}
-	w.logf("hull run %s: %d vCPU, %d MB, %s, argv %q", st.Instance, cpus, mem, spec.GatewayCIDR, argv)
+	var shareArgs []string
+	for _, sh := range shares {
+		shareArgs = append(shareArgs, sh.Arg())
+	}
+	w.logf("hull run %s: %d vCPU, %d MB, %s, %d env (%d from Secrets), shares %q, argv %q",
+		st.Instance, cpus, mem, spec.GatewayCIDR, len(env), len(secret), shareArgs, argv)
 	t0 := time.Now()
 	rctx, cancel := context.WithTimeout(ctx, runTimeout)
 	_, err = h.Run(rctx, spec)
@@ -515,23 +634,33 @@ func (w *podWorker) start(ctx context.Context) error {
 		return err
 	}
 	started := time.Now()
-	w.set(func(st *podState) { st.Created = true; st.Env = env; st.ImageID = imageID(c.Image, img) })
+	w.set(func(st *podState) { st.Created = true; st.Env = pairs; st.ImageID = imageID(c.Image, img) })
 	w.event(corev1.EventTypeNormal, "Created", "Created container: %s", c.Name)
 	w.logf("VM %s up in %.1fs", st.Instance, time.Since(t0).Seconds())
 	w.setHostname(ctx, pod, ip)
+	w.ensureForwards(ctx, c)
 	w.set(func(st *podState) {
 		st.Running = true
 		st.StartedAt = started
 		st.Waiting = nil
 		st.Term = nil
+		initialProbeState(c, st)
 	})
 	w.event(corev1.EventTypeNormal, "Started", "Started container %s", c.Name)
 	return nil
 }
 
+// metaKey fingerprints what a downwardAPI volume can read from the pod
+// metadata that changes while the pod runs. fmt prints maps sorted.
+func metaKey(pod *corev1.Pod) string {
+	return fmt.Sprint(pod.Labels, pod.Annotations)
+}
+
 // ensureImage applies imagePullPolicy and returns the image record.
 func (w *podWorker) ensureImage(ctx context.Context, c *corev1.Container) (*hull.Image, error) {
 	h := w.m.hull
+	w.m.pullMu.Lock()
+	defer w.m.pullMu.Unlock()
 	img, local := h.LocalImage(c.Image)
 	policy := podvm.PullPolicy(c)
 	switch {
@@ -589,7 +718,14 @@ func (w *podWorker) setHostname(ctx context.Context, pod *corev1.Pod, ip string)
 	if len(name) > 63 {
 		name = name[:63]
 	}
-	script := `hostname "$1" && echo "$1" > /etc/hostname && printf '%s\t%s\n' "$2" "$1" >> /etc/hosts`
+	// hull's guest /dev has no stdin, stdout, stderr or fd links. A process
+	// that opens /dev/stdout before this runs creates a regular file there;
+	// one that starts later gets the console.
+	script := `hostname "$1" && echo "$1" > /etc/hostname && printf '%s\t%s\n' "$2" "$1" >> /etc/hosts
+rc=$?
+for n in 0:stdin 1:stdout 2:stderr; do [ -e "/dev/${n#*:}" ] || ln -s "/proc/self/fd/${n%%:*}" "/dev/${n#*:}"; done
+[ -e /dev/fd ] || ln -s /proc/self/fd /dev/fd
+exit $rc`
 	argv := []string{"/bin/sh", "-c", script, "sh", name, ip}
 	deadline := time.Now().Add(hostnameWait)
 	for {
@@ -615,25 +751,102 @@ func (w *podWorker) setHostname(ctx context.Context, pod *corev1.Pod, ip string)
 	}
 }
 
-// watch polls the VMM until it exits and returns the exit code briglet
-// reports for it. ok is false when the pod started stopping or ctx ended.
+// watch polls the VMM every pollInterval until it exits, runs the probes
+// when they are due, and keeps the volumes current. It returns the exit code
+// briglet reports for the container: the VM's, or 137 when a startup or
+// liveness probe failed and the agent stopped the VM. ok is false when the
+// pod started stopping or ctx ended.
 func (w *podWorker) watch(ctx context.Context) (code int32, ok bool) {
+	nextInspect := time.Now()
 	for {
 		if w.stopping() || ctx.Err() != nil {
 			return 0, false
 		}
-		id := w.snapshot().Instance
-		in, err := w.m.hull.Inspect(ctx, id)
-		switch {
-		case errors.Is(err, hull.ErrNotFound):
-			return exitCodeKilled, true
-		case err != nil:
-			w.logf("inspect %s: %v", id, err)
-		case !in.Alive():
-			return w.exitCode(ctx, id), true
+		pod, _ := w.current()
+		pod = w.effectivePod(ctx, pod)
+		if now := time.Now(); !now.Before(nextInspect) {
+			id := w.snapshot().Instance
+			in, err := w.m.hull.Inspect(ctx, id)
+			switch {
+			case errors.Is(err, hull.ErrNotFound):
+				return exitCodeKilled, true
+			case err != nil:
+				w.logf("inspect %s: %v", id, err)
+			case !in.Alive():
+				return w.exitCode(ctx, id), true
+			}
+			nextInspect = now.Add(pollInterval)
+			w.gcVolumes(pod)
 		}
-		if w.sleep(ctx, pollInterval) {
+		w.maybeRefreshVolumes(ctx, pod)
+		kill, changed, next := w.probe(ctx, pod, time.Now())
+		if changed {
+			w.syncStatus(ctx)
+		}
+		if kill != "" {
+			w.kill(ctx, pod, kill)
+			return exitCodeKilled, true
+		}
+		wait := time.Until(nextInspect)
+		if !next.IsZero() {
+			wait = min(wait, time.Until(next))
+		}
+		if tr := w.snapshot().TokenRefreshAt; !tr.IsZero() {
+			wait = min(wait, time.Until(tr))
+		}
+		if w.nap(ctx, max(wait, 100*time.Millisecond)) {
 			return 0, false
+		}
+	}
+}
+
+// kill stops the VM of a container whose startup or liveness probe failed,
+// with the probe's terminationGracePeriodSeconds or the pod's.
+func (w *podWorker) kill(ctx context.Context, pod *corev1.Pod, kind string) {
+	c := &pod.Spec.Containers[0]
+	grace := podvm.GraceSeconds(pod)
+	for _, ps := range probesOf(c) {
+		if ps.kind == kind && ps.p.TerminationGracePeriodSeconds != nil {
+			grace = int(*ps.p.TerminationGracePeriodSeconds)
+		}
+	}
+	id := w.snapshot().Instance
+	t0 := time.Now()
+	sctx, cancel := context.WithTimeout(ctx, time.Duration(grace+60)*time.Second)
+	defer cancel()
+	if err := w.m.hull.Stop(sctx, id, grace); err != nil {
+		w.logf("stop %s after the %s probe failed: %v", id, kind, err)
+	}
+	w.logf("VM %s stopped in %.1fs after the %s probe failed", id, time.Since(t0).Seconds(), kind)
+}
+
+// maybeRefreshVolumes rewrites the volumes when a ConfigMap or Secret they
+// read changed, the pod metadata changed, or a token is due.
+func (w *podWorker) maybeRefreshVolumes(ctx context.Context, pod *corev1.Pod) {
+	meta := metaKey(pod)
+	tr := w.snapshot().TokenRefreshAt
+	dirty := w.takeVolumesDirty()
+	if !dirty && meta == w.lastMeta && (tr.IsZero() || time.Now().Before(tr)) {
+		return
+	}
+	w.lastMeta = meta
+	changed, err := w.refreshVolumes(ctx, pod)
+	if err != nil {
+		w.logf("refresh volumes: %v", err)
+		w.event(corev1.EventTypeWarning, "FailedMount", "%v", err)
+		return
+	}
+	if changed {
+		w.logf("volumes updated")
+	}
+}
+
+// gcVolumes removes timestamp directories the volumes retired.
+func (w *podWorker) gcVolumes(pod *corev1.Pod) {
+	dirs := w.podDirs()
+	for i := range pod.Spec.Volumes {
+		if v := &pod.Spec.Volumes[i]; podvm.Atomic(v) {
+			_ = podvm.GCAtomic(dirs.VolumeDir(v.Name), time.Now())
 		}
 	}
 }
@@ -672,6 +885,11 @@ func (w *podWorker) teardown(ctx context.Context) {
 			w.logf("VM %s stopped and removed in %.1fs", st.Instance, time.Since(t0).Seconds())
 		}
 	}
+	w.m.sources.Release(w.uid)
+	w.m.src.forget(w.uid)
+	fctx, fcancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	removeForwards(fctx, w.m.gw, &st)
+	fcancel()
 	if err := w.m.ipam.Release(string(w.uid)); err != nil {
 		w.logf("release address: %v", err)
 	}

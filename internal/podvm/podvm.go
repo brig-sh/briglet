@@ -64,6 +64,7 @@ func Validate(pod *corev1.Pod) string {
 			why = append(why, "container securityContext.runAsUser")
 		}
 	}
+	why = append(why, unsupportedVolumes(pod)...)
 	if len(why) == 0 {
 		return ""
 	}
@@ -75,6 +76,12 @@ func Ignored(c *corev1.Container) []string {
 	var out []string
 	if c.WorkingDir != "" {
 		out = append(out, fmt.Sprintf("workingDir %q is ignored: hull starts the container in /", c.WorkingDir))
+	}
+	for _, p := range []*corev1.Probe{c.StartupProbe, c.LivenessProbe, c.ReadinessProbe} {
+		if p != nil && p.GRPC != nil {
+			out = append(out, fmt.Sprintf("gRPC probe on port %d is checked as a TCP connect: briglet does not speak the gRPC health protocol", p.GRPC.Port))
+			break
+		}
 	}
 	return out
 }
@@ -145,65 +152,6 @@ func Argv(c *corev1.Container, img *hull.ImageConfig, env []string) ([]string, e
 		}
 	}
 	return argv, nil
-}
-
-// FieldValues are the values a fieldRef can name.
-type FieldValues struct {
-	PodIP    string
-	NodeName string
-}
-
-// Env computes the container environment: HOSTNAME, then the image ENV,
-// then the container env in order. Later entries win. valueFrom supports
-// fieldRef for metadata.name, metadata.namespace, metadata.uid, status.podIP
-// and spec.nodeName; configMapKeyRef, secretKeyRef and resourceFieldRef
-// return an error.
-func Env(pod *corev1.Pod, c *corev1.Container, img *hull.ImageConfig, fv FieldValues) ([]string, error) {
-	var order []string
-	vals := map[string]string{}
-	set := func(k, v string) {
-		if _, ok := vals[k]; !ok {
-			order = append(order, k)
-		}
-		vals[k] = v
-	}
-	set("HOSTNAME", pod.Name)
-	for _, kv := range img.Env {
-		k, v, _ := strings.Cut(kv, "=")
-		set(k, v)
-	}
-	if len(c.EnvFrom) > 0 {
-		return nil, fmt.Errorf("envFrom is not supported yet")
-	}
-	for _, e := range c.Env {
-		if e.ValueFrom == nil {
-			set(e.Name, expand(e.Value, vals))
-			continue
-		}
-		f := e.ValueFrom.FieldRef
-		if f == nil {
-			return nil, fmt.Errorf("env %s: only fieldRef is supported in valueFrom for now", e.Name)
-		}
-		switch f.FieldPath {
-		case "metadata.name":
-			set(e.Name, pod.Name)
-		case "metadata.namespace":
-			set(e.Name, pod.Namespace)
-		case "metadata.uid":
-			set(e.Name, string(pod.UID))
-		case "status.podIP":
-			set(e.Name, fv.PodIP)
-		case "spec.nodeName":
-			set(e.Name, fv.NodeName)
-		default:
-			return nil, fmt.Errorf("env %s: fieldRef %s is not supported yet", e.Name, f.FieldPath)
-		}
-	}
-	out := make([]string, 0, len(order))
-	for _, k := range order {
-		out = append(out, k+"="+vals[k])
-	}
-	return out, nil
 }
 
 func envMap(env []string) map[string]string {

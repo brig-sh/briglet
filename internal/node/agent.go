@@ -65,6 +65,8 @@ type Config struct {
 	PodsDir     string
 	IPAMFile    string
 	PodCIDR     string
+	// APIServiceIP is the cluster IP of the `kubernetes` Service.
+	APIServiceIP string
 }
 
 // Agent is a running node agent.

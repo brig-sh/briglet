@@ -89,8 +89,8 @@ func (w *podWorker) status(cur *corev1.Pod) corev1.PodStatus {
 		Image:        c.Image,
 		ImageID:      st.ImageID,
 		RestartCount: st.RestartCount,
-		Started:      ptr.To(st.Running),
-		Ready:        st.Running,
+		Started:      ptr.To(st.Running && st.Started),
+		Ready:        st.Running && st.Ready,
 	}
 	if st.Created {
 		cs.ContainerID = "hull://" + st.Instance
@@ -124,7 +124,7 @@ func (w *podWorker) status(cur *corev1.Pod) corev1.PodStatus {
 	default:
 		out.Phase = corev1.PodPending
 	}
-	ready := st.Running
+	ready := cs.Ready
 	out.Conditions = mergeConditions(cur, out.Conditions, map[corev1.PodConditionType]bool{
 		corev1.PodScheduled:              true,
 		corev1.PodReadyToStartContainers: st.Running || (st.Created && !st.Done),
