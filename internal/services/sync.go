@@ -30,6 +30,8 @@ import (
 	discoverylisters "k8s.io/client-go/listers/discovery/v1"
 	"k8s.io/client-go/tools/cache"
 
+	corev1 "k8s.io/api/core/v1"
+
 	"github.com/brig-sh/briglet/internal/hull"
 )
 
@@ -51,26 +53,29 @@ type Syncer struct {
 	debug  bool
 	svcs   corelisters.ServiceLister
 	slices discoverylisters.EndpointSliceLister
+	nodes  corelisters.NodeLister
 	synced []cache.InformerSynced
 	kick   chan struct{}
 	// installed is the last table the gateway accepted.
 	installed []hull.Service
 }
 
-// New registers the Service and EndpointSlice informers on factory. The
-// caller starts the factory.
+// New registers the Service, EndpointSlice and Node informers on factory.
+// The caller starts the factory.
 func New(factory informers.SharedInformerFactory, gw *hull.Gateway, p Params, debug bool) (*Syncer, error) {
 	s := &Syncer{gw: gw, p: p, debug: debug, kick: make(chan struct{}, 1)}
 	svcInf := factory.Core().V1().Services()
 	sliceInf := factory.Discovery().V1().EndpointSlices()
+	nodeInf := factory.Core().V1().Nodes()
 	s.svcs = svcInf.Lister()
 	s.slices = sliceInf.Lister()
+	s.nodes = nodeInf.Lister()
 	h := cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(any) { s.trigger() },
 		UpdateFunc: func(_, _ any) { s.trigger() },
 		DeleteFunc: func(any) { s.trigger() },
 	}
-	for _, inf := range []cache.SharedIndexInformer{svcInf.Informer(), sliceInf.Informer()} {
+	for _, inf := range []cache.SharedIndexInformer{svcInf.Informer(), sliceInf.Informer(), nodeInf.Informer()} {
 		if _, err := inf.AddEventHandler(h); err != nil {
 			return nil, err
 		}
@@ -132,7 +137,9 @@ func (s *Syncer) sync(ctx context.Context, check bool) bool {
 		log.Printf("services: list endpointslices: %v", err)
 		return false
 	}
-	table, skipped := Build(svcs, slices, s.p)
+	p := s.p
+	p.Nodes = s.nodeIPs()
+	table, skipped := Build(svcs, slices, p)
 	for _, sk := range skipped {
 		log.Printf("services: skipping endpoint %s: not on the pod network or the gateway", sk)
 	}
@@ -170,6 +177,26 @@ func (s *Syncer) sync(ctx context.Context, check bool) bool {
 		ok = false
 	}
 	return ok
+}
+
+// nodeIPs maps each node's name to its InternalIP: the address a remote
+// Service endpoint is stitched to.
+func (s *Syncer) nodeIPs() map[string]string {
+	ns, err := s.nodes.List(labels.Everything())
+	if err != nil {
+		log.Printf("services: list nodes: %v", err)
+		return nil
+	}
+	out := map[string]string{}
+	for _, n := range ns {
+		for _, a := range n.Status.Addresses {
+			if a.Type == corev1.NodeInternalIP && a.Address != "" {
+				out[n.Name] = a.Address
+				break
+			}
+		}
+	}
+	return out
 }
 
 // equalTables compares two tables, treating a missing endpoint list as

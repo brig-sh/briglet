@@ -50,6 +50,13 @@ func APIServerURL() string {
 // WriteKubeconfig writes a kubeconfig for the client cert pki/<certName>.{crt,key}
 // with all PEM data embedded, so the file is self-contained.
 func WriteKubeconfig(path, pkiDir, certName, user string) error {
+	return WriteKubeconfigTo(path, pkiDir, certName, user, APIServerURL())
+}
+
+// WriteKubeconfigTo writes a kubeconfig with an explicit API server URL,
+// for clients that reach the apiserver at another address, such as node
+// agents joining from another host.
+func WriteKubeconfigTo(path, pkiDir, certName, user, serverURL string) error {
 	ca, err := readPEM(filepath.Join(pkiDir, "ca.crt"))
 	if err != nil {
 		return err
@@ -63,7 +70,7 @@ func WriteKubeconfig(path, pkiDir, certName, user string) error {
 		return err
 	}
 	cfg := clientcmdapi.NewConfig()
-	cfg.Clusters[clusterName] = &clientcmdapi.Cluster{Server: APIServerURL(), CertificateAuthorityData: ca}
+	cfg.Clusters[clusterName] = &clientcmdapi.Cluster{Server: serverURL, CertificateAuthorityData: ca}
 	cfg.AuthInfos[user] = &clientcmdapi.AuthInfo{ClientCertificateData: crt, ClientKeyData: key}
 	ctx := user + "@" + clusterName
 	cfg.Contexts[ctx] = &clientcmdapi.Context{Cluster: clusterName, AuthInfo: user}

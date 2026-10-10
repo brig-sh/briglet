@@ -27,12 +27,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Pod addresses come from the gateway subnet. 10.87.0.1 is the gateway and
-// .2 to .9 are kept free.
-const (
-	firstPodHost = 10
-	lastPodHost  = 254
-)
+// Pod addresses come from the gateway subnet. The subnet's first address
+// is the gateway and the next nine are kept free; the broadcast address
+// is never handed out. The range is a /24, or a /25 half of one when two
+// agents share a gateway.
+const firstPodHost = 10
 
 // IPAM hands out pod addresses and persists them in a JSON file, guarded by
 // an flock on a sibling lock file so two agents never share an address.
@@ -48,19 +47,23 @@ type Allocation struct {
 	Addr string `json:"addr"`
 }
 
-// NewIPAM returns an allocator over cidr (a /24) persisted at path.
+// NewIPAM returns an allocator over cidr persisted at path. The cidr is a
+// /24 or a /25 half of the gateway's /24.
 func NewIPAM(path, cidr string) (*IPAM, error) {
 	p, err := netip.ParsePrefix(cidr)
 	if err != nil {
 		return nil, err
 	}
-	if p.Bits() != 24 || !p.Addr().Is4() {
-		return nil, fmt.Errorf("pod CIDR %s: only an IPv4 /24 is supported", cidr)
+	if p.Bits() != 24 && p.Bits() != 25 || !p.Addr().Is4() {
+		return nil, fmt.Errorf("pod CIDR %s: only an IPv4 /24 or /25 is supported", cidr)
 	}
 	return &IPAM{path: path, prefix: p.Masked()}, nil
 }
 
-// Bits is the prefix length, for --gateway-cidr.
+// Bits is the interface mask for --gateway-cidr. The gateway's pod
+// network is one L2 /24 when nodes share a gateway; a standalone
+// gateway on a /25 half uses its own mask, so the guest's on-link route
+// and derived gateway address match the netstack that actually serves it.
 func (m *IPAM) Bits() int { return m.prefix.Bits() }
 
 func (m *IPAM) locked(f func(map[string]Allocation) (bool, error)) error {
@@ -130,18 +133,22 @@ func (m *IPAM) Allocate(uid, pod string) (string, error) {
 		for _, a := range byUID {
 			used[a.Addr] = true
 		}
-		start := firstPodHost
+		base := m.prefix.Addr().As4()
+		// The range spans from firstPodHost above the network address to
+		// one below the broadcast, all inside the last octet.
+		size := 1 << (32 - m.prefix.Bits())
+		lo := int(base[3]) + firstPodHost
+		n := size - firstPodHost - 1
+		start := 0
 		if b, err := os.ReadFile(m.lastPath()); err == nil {
-			if last, err := netip.ParseAddr(strings.TrimSpace(string(b))); err == nil && m.prefix.Contains(last) {
-				if h := int(last.As4()[3]); h >= firstPodHost && h < lastPodHost {
+			if prev, err := netip.ParseAddr(strings.TrimSpace(string(b))); err == nil && m.prefix.Contains(prev) {
+				if h := int(prev.As4()[3]) - lo; h >= 0 && h < n {
 					start = h + 1
 				}
 			}
 		}
-		base := m.prefix.Addr().As4()
-		n := lastPodHost - firstPodHost + 1
-		for i := range n {
-			base[3] = byte(firstPodHost + (start-firstPodHost+i)%n)
+		for i := 0; i < n; i++ {
+			base[3] = byte(lo + (start+i)%n)
 			cand := netip.AddrFrom4(base).String()
 			if used[cand] {
 				continue

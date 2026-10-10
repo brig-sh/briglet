@@ -38,6 +38,7 @@ commands:
   down [--wipe]   stop everything; --wipe also removes the state dir
   status          show component pids and health
   node            run the node agent in the foreground
+  join            mint credentials for a second node agent
 `
 
 func main() {
@@ -57,6 +58,8 @@ func main() {
 		err = cmdStatus(ctx)
 	case "node":
 		err = cmdNode(ctx, os.Args[2:])
+	case "join":
+		err = cmdJoin(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 	default:
@@ -114,12 +117,10 @@ func cmdNode(ctx context.Context, args []string) error {
 	cfg := node.Config{
 		StateDir:    p.Root,
 		HullBin:     cp.HullBin(),
-		HostIP:      cp.GatewayIP,
 		HullStore:   p.HullStore,
 		GatewaySock: p.GatewaySock,
 		PodsDir:     p.Pods,
 		IPAMFile:    p.IPAM,
-		PodCIDR:     cp.ClusterCIDR,
 
 		APIServiceIP:   cp.ServiceAPIServerIP,
 		ServiceCIDR:    cp.ServiceCIDR,
@@ -141,7 +142,25 @@ func cmdNode(ctx context.Context, args []string) error {
 	fs.StringVar(&cfg.TLSCertFile, "tls-cert-file", filepath.Join(p.PKI, "kubelet-serving.crt"), "kubelet serving cert")
 	fs.StringVar(&cfg.TLSKeyFile, "tls-private-key-file", filepath.Join(p.PKI, "kubelet-serving.key"), "kubelet serving key")
 	fs.StringVar(&cfg.ClientCAFile, "client-ca-file", filepath.Join(p.PKI, "ca.crt"), "CA that signs accepted client certs")
+	fs.StringVar(&cfg.PodCIDR, "pod-cidr", "", "pod CIDR this node allocates from; empty adopts spec.podCIDR from the apiserver")
+	fs.StringVar(&cfg.HostIP, "host-ip", "", "address pods reach the host at; reported as hostIP (default: the pod CIDR's first address; pass the shared gateway's address when sharing one with --gateway-sock)")
+	fs.StringVar(&cfg.GatewaySock, "gateway-sock", p.GatewaySock, "hull gateway control socket, whose service table and pod network the node uses")
+	fs.StringVar(&cfg.HullStore, "hull-store", p.HullStore, "hull store directory for this node's pod VMs")
 	_ = fs.Parse(args)
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	return node.Run(ctx, cfg)
+}
+
+func cmdJoin(args []string) error {
+	fs := flag.NewFlagSet("join", flag.ExitOnError)
+	name := fs.String("name", "", "name of the joining node (required)")
+	ip := fs.String("ip", "127.0.0.1", "InternalIP of the joining node; the apiserver dials it for logs and exec")
+	port := fs.Int("port", cp.KubeletPort, "kubelet HTTPS port of the joining node")
+	serverIP := fs.String("server-ip", "", "address the joining node reaches the apiserver at (default: this Mac's LAN address)")
+	out := fs.String("out", "", "output directory (default: <state>/join/<name>)")
+	_ = fs.Parse(args)
+	if *name == "" {
+		return fmt.Errorf("--name is required")
+	}
+	return cp.JoinBundle(*name, *ip, *port, *serverIP, *out, os.Stdout)
 }

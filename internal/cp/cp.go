@@ -157,7 +157,9 @@ func NewCluster() (*Cluster, error) {
 		"--controllers=*,bootstrapsigner,tokencleaner",
 		"--allocate-node-cidrs=true",
 		"--cluster-cidr="+ClusterCIDR,
-		"--node-cidr-mask-size=24",
+		// One /24 pod network behind the gateway. Every node's IPAM gets
+		// half of it, so two agents can share one gateway.
+		"--node-cidr-mask-size=25",
 		"--service-cluster-ip-range="+ServiceCIDR,
 		"--cluster-signing-cert-file="+pki("ca.crt"),
 		"--cluster-signing-key-file="+pki("ca.key"),
@@ -187,9 +189,17 @@ func NewCluster() (*Cluster, error) {
 		"--service-cidr", ServiceCIDR,
 	)...)
 	gwAPI := hull.NewGateway(p.GatewayAPI)
+	// The node reports a LAN address when one exists, so other nodes and
+	// the Service stitching reach its kubelet; loopback keeps a
+	// network-isolated Mac working.
+	nodeIP := NodeIP
+	if ips := hostIPv4s(); len(ips) > 0 {
+		nodeIP = ips[0].String()
+	}
 	node := NewProc(p, "node", self, "node",
 		"--kubeconfig="+p.Kubeconfig("node"),
 		"--name="+name,
+		"--node-ip="+nodeIP,
 		"--tls-cert-file="+pki("kubelet-serving.crt"),
 		"--tls-private-key-file="+pki("kubelet-serving.key"),
 		"--client-ca-file="+pki("ca.crt"),

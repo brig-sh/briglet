@@ -115,6 +115,51 @@ func TestBuildNoEndpoints(t *testing.T) {
 	}
 }
 
+func TestBuildRemoteNode(t *testing.T) {
+	// The second node's view: its gateway is 10.87.0.129, its IPAM half
+	// is the upper /25, its kubeconfig points at the control plane Mac.
+	p := Params{
+		GatewayIP:       "10.87.0.129",
+		APIServerDialIP: "192.0.2.10",
+		PodCIDR:         netip.MustParsePrefix("10.87.0.128/25"),
+		ServiceCIDR:     netip.MustParsePrefix("10.96.0.0/12"),
+		Nodes:           map[string]string{"node1": "192.0.2.10"},
+	}
+	svcs := []*corev1.Service{
+		svc("default", "kubernetes", "10.96.0.1", corev1.ServiceTypeClusterIP,
+			corev1.ServicePort{Name: "https", Port: 443, Protocol: corev1.ProtocolTCP}),
+		svc("default", "web", "10.96.5.5", corev1.ServiceTypeNodePort,
+			corev1.ServicePort{Port: 80, NodePort: 30080}),
+		svc("default", "noport", "10.96.5.6", corev1.ServiceTypeClusterIP,
+			corev1.ServicePort{Port: 80}),
+	}
+	remote := discoveryv1.Endpoint{
+		Addresses:  []string{"10.87.0.14"},
+		NodeName:   ptr.To("node1"),
+		Conditions: discoveryv1.EndpointConditions{Ready: ptr.To(true)},
+	}
+	local := ep(ptr.To(true), "10.87.0.140")
+	slices := []*discoveryv1.EndpointSlice{
+		slice("default", "kubernetes", []discoveryv1.EndpointPort{port("https", corev1.ProtocolTCP, 6443)},
+			ep(nil, "10.87.0.1")),
+		slice("default", "web", []discoveryv1.EndpointPort{port("", corev1.ProtocolTCP, 8080)},
+			remote, local),
+		slice("default", "noport", []discoveryv1.EndpointPort{port("", corev1.ProtocolTCP, 8080)},
+			remote),
+	}
+	table, skipped := Build(svcs, slices, p)
+	got, _ := json.Marshal(table)
+	want := `[{"vip":"10.96.0.1","port":443,"protocol":"tcp","endpoints":[{"ip":"192.0.2.10","port":6443,"host":true}]},` +
+		`{"vip":"10.96.5.5","port":80,"protocol":"tcp","endpoints":[{"ip":"10.87.0.140","port":8080},{"ip":"192.0.2.10","port":30080,"host":true}]},` +
+		`{"vip":"10.96.5.6","port":80,"protocol":"tcp","endpoints":[]}]`
+	if string(got) != want {
+		t.Fatalf("table\n got %s\nwant %s", got, want)
+	}
+	if len(skipped) != 1 || skipped[0] != "default/noport 10.87.0.14:8080" {
+		t.Fatalf("skipped = %q", skipped)
+	}
+}
+
 func TestOwnedForward(t *testing.T) {
 	s := &Syncer{p: params}
 	for f, want := range map[[2]string]bool{

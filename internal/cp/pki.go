@@ -63,7 +63,9 @@ func LeafSpecs(nodeName string) []CertSpec {
 		{
 			Name: "apiserver", CN: "kube-apiserver", Server: true,
 			DNS: []string{"localhost", "kubernetes", "kubernetes.default", "kubernetes.default.svc", "kubernetes.default.svc.cluster.local"},
-			IPs: []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP(ServiceAPIServerIP), net.ParseIP(GatewayIP)},
+			// The LAN addresses let node agents on other hosts verify the
+			// apiserver when they join.
+			IPs: append([]net.IP{net.ParseIP("127.0.0.1"), net.ParseIP(ServiceAPIServerIP), net.ParseIP(GatewayIP)}, hostIPv4s()...),
 		},
 		{Name: "apiserver-kubelet-client", CN: "kube-apiserver-kubelet-client", Client: true},
 		{Name: "apiserver-etcd-client", CN: "kube-apiserver-etcd-client", Client: true},
@@ -78,7 +80,9 @@ func LeafSpecs(nodeName string) []CertSpec {
 		{
 			Name: "kubelet-serving", CN: "system:node:" + nodeName, Orgs: []string{"system:nodes"}, Server: true,
 			DNS: []string{nodeName, nodeName + ".local", "localhost"},
-			IPs: []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP(GatewayIP)},
+			// The LAN addresses let the apiserver dial this node's kubelet
+			// from other hosts, as a multi-node cluster does.
+			IPs: append([]net.IP{net.ParseIP("127.0.0.1"), net.ParseIP(GatewayIP)}, hostIPv4s()...),
 		},
 	}
 }
@@ -227,6 +231,37 @@ func serial() *big.Int {
 		panic(err)
 	}
 	return n
+}
+
+// hostIPv4s lists this Mac's routable IPv4 addresses. Loopback and
+// link-local addresses are left out.
+func hostIPv4s() []net.IP {
+	var out []net.IP
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	for _, ifc := range ifaces {
+		if ifc.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := ifc.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipn, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip4 := ipn.IP.To4()
+			if ip4 == nil || ip4.IsLoopback() || ip4.IsLinkLocalUnicast() {
+				continue
+			}
+			out = append(out, ip4)
+		}
+	}
+	return out
 }
 
 func writePair(certPath, keyPath string, der []byte, key *ecdsa.PrivateKey) error {

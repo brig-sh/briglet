@@ -36,14 +36,21 @@ const (
 
 // Params are the network facts the table is built against.
 type Params struct {
-	// GatewayIP is the address the apiserver publishes itself at. An
-	// endpoint there is the host, reached at 127.0.0.1.
+	// GatewayIP is this node's gateway address. An endpoint there is the
+	// host the agent runs on, reached at 127.0.0.1.
 	GatewayIP string
-	// PodCIDR holds the guest endpoints. Other addresses are skipped: the
-	// gateway refuses a table with a guest endpoint off its subnet.
+	// APIServerDialIP is where this node reaches the control plane: the
+	// kubeconfig server's address. The kubernetes Service carries it.
+	APIServerDialIP string
+	// PodCIDR holds this node's guest endpoints. Other pod addresses are
+	// stitched through the Service's node port when possible, and
+	// skipped otherwise.
 	PodCIDR netip.Prefix
 	// ServiceCIDR holds the cluster IPs.
 	ServiceCIDR netip.Prefix
+	// Nodes maps a node name to its InternalIP, for endpoints that run
+	// on another node. Nil disables stitching.
+	Nodes map[string]string
 }
 
 func protocolOf(p corev1.Protocol) string {
@@ -83,12 +90,20 @@ func Build(svcs []*corev1.Service, slices []*discoveryv1.EndpointSlice, p Params
 		bySvc[sl.Namespace+"/"+name] = append(bySvc[sl.Namespace+"/"+name], sl)
 	}
 	gwIP, _ := netip.ParseAddr(p.GatewayIP)
+	apiDial := p.APIServerDialIP
+	if apiDial == "" {
+		apiDial = "127.0.0.1"
+	}
 	table = []hull.Service{}
 	for _, s := range svcs {
 		vip, ok := routed(s, p)
 		if !ok {
 			continue
 		}
+		// The kubernetes Service's endpoint is the apiserver's advertise
+		// address, which only the first node's gateway can reach. Every
+		// node dials the control plane at its own kubeconfig address.
+		isKubernetes := s.Namespace == "default" && s.Name == "kubernetes"
 		for _, sp := range s.Spec.Ports {
 			proto := protocolOf(sp.Protocol)
 			if proto == "" {
@@ -111,10 +126,17 @@ func Build(svcs []*corev1.Service, slices []*discoveryv1.EndpointSlice, p Params
 						switch {
 						case err != nil:
 							continue
+						case isKubernetes:
+							e = hull.ServiceEndpoint{IP: apiDial, Port: port, Host: true}
 						case ip == gwIP:
 							e = hull.ServiceEndpoint{IP: "127.0.0.1", Port: port, Host: true}
 						case p.PodCIDR.Contains(ip):
 							e = hull.ServiceEndpoint{IP: a, Port: port}
+						case ep.NodeName != nil && sp.NodePort != 0 && p.Nodes[*ep.NodeName] != "":
+							// A pod on another node: the gateway cannot
+							// reach its address, but the node answers its
+							// port for the Service's node port.
+							e = hull.ServiceEndpoint{IP: p.Nodes[*ep.NodeName], Port: sp.NodePort, Host: true}
 						default:
 							skipped = append(skipped, s.Namespace+"/"+s.Name+" "+net.JoinHostPort(a, strconv.Itoa(int(port))))
 							continue

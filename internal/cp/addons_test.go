@@ -38,7 +38,7 @@ func TestAddonObjects(t *testing.T) {
 		t.Fatalf("objects\n got %s\nwant %s", got, want)
 	}
 	subj := objs[0].Object["subjects"].([]any)[0].(map[string]any)
-	if subj["name"] != "system:node:node1" {
+	if subj["kind"] != "Group" || subj["name"] != "system:nodes" {
 		t.Errorf("node-proxier subject = %v", subj)
 	}
 	cf := objs[4].Object["data"].(map[string]any)["Corefile"].(string)

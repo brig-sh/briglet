@@ -20,7 +20,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/netip"
+	"net/url"
 	"path/filepath"
 	"time"
 
@@ -115,42 +117,58 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	h := hull.New(cfg.HullBin, cfg.HullStore)
 	shared := informers.NewSharedInformerFactory(cs, 0)
-	pm, err := newPodManager(cs, cfg, h, shared)
-	if err != nil {
-		return err
-	}
-	podCIDR, err := netip.ParsePrefix(cfg.PodCIDR)
-	if err != nil {
-		return fmt.Errorf("pod CIDR: %w", err)
-	}
 	svcCIDR, err := netip.ParsePrefix(cfg.ServiceCIDR)
 	if err != nil {
 		return fmt.Errorf("service CIDR: %w", err)
 	}
+	a := &Agent{cfg: cfg, cs: cs, facts: facts}
+
+	errc := make(chan error, 3)
+	if err := retryUntil(ctx, "register node", a.register); err != nil {
+		return err
+	}
+	log.Printf("node %s registered (uid %s): %d cpu, %d bytes memory, os image %q", cfg.Name, a.uid, facts.CPUs, facts.MemoryBytes, facts.OSImage)
+	if err := retryUntil(ctx, "pod CIDR", a.awaitPodCIDR); err != nil {
+		return err
+	}
+	log.Printf("node %s: pod CIDR %s", cfg.Name, a.cfg.PodCIDR)
+	if a.cfg.HostIP == "" {
+		// The gateway owns the first address of the pod CIDR.
+		p, err := netip.ParsePrefix(a.cfg.PodCIDR)
+		if err != nil {
+			return err
+		}
+		b := p.Addr().As4()
+		b[3]++
+		a.cfg.HostIP = netip.AddrFrom4(b).String()
+	}
+	podCIDR, err := netip.ParsePrefix(a.cfg.PodCIDR)
+	if err != nil {
+		return fmt.Errorf("pod CIDR %s: %w", a.cfg.PodCIDR, err)
+	}
+	log.Printf("node %s: gateway %s", cfg.Name, a.cfg.HostIP)
+	go func() {
+		if err := serveEgressProxy(ctx, filepath.Join(cfg.StateDir, "egress.sock"), hull.NewGateway(cfg.GatewaySock+".api"), svcCIDR, podCIDR, cfg.NodeIP); err != nil && ctx.Err() == nil {
+			errc <- fmt.Errorf("egress proxy: %w", err)
+		}
+	}()
+
+	pm, err := newPodManager(cs, a.cfg, h, shared)
+	if err != nil {
+		return err
+	}
 	ss, err := services.New(shared, hull.NewGateway(cfg.GatewaySock+".api"), services.Params{
-		GatewayIP: cfg.HostIP, PodCIDR: podCIDR, ServiceCIDR: svcCIDR,
+		GatewayIP: cfg.HostIP, APIServerDialIP: apiDialIP(rc.Host), PodCIDR: podCIDR, ServiceCIDR: svcCIDR,
 	}, cfg.Debug)
 	if err != nil {
 		return err
 	}
-	a := &Agent{cfg: cfg, cs: cs, facts: facts, pods: pm}
 
-	errc := make(chan error, 3)
-	go func() {
-		if err := serveEgressProxy(ctx, filepath.Join(cfg.StateDir, "egress.sock"), hull.NewGateway(cfg.GatewaySock+".api"), svcCIDR, podCIDR); err != nil && ctx.Err() == nil {
-			errc <- fmt.Errorf("egress proxy: %w", err)
-		}
-	}()
 	go func() {
 		if err := serveKubelet(ctx, fmt.Sprintf(":%d", cfg.Port), cfg.TLSCertFile, cfg.TLSKeyFile, cfg.ClientCAFile, cfg.Name, pm); err != nil {
 			errc <- fmt.Errorf("kubelet server: %w", err)
 		}
 	}()
-
-	if err := retryUntil(ctx, "register node", a.register); err != nil {
-		return err
-	}
-	log.Printf("node %s registered (uid %s): %d cpu, %d bytes memory, os image %q", cfg.Name, a.uid, facts.CPUs, facts.MemoryBytes, facts.OSImage)
 
 	go a.loop(ctx, "lease", renewInterval, a.renewLease)
 	go a.loop(ctx, "status", statusInterval, a.updateStatus)
@@ -309,6 +327,44 @@ func (a *Agent) register(ctx context.Context) error {
 		a.uid = string(upd.UID)
 		return nil
 	})
+}
+
+// apiDialIP returns the host of the kubeconfig server URL: the address
+// this node reaches the control plane at. It feeds the kubernetes Service
+// entry, so a node on another host dials the apiserver over the LAN.
+func apiDialIP(server string) string {
+	u, err := url.Parse(server)
+	if err != nil {
+		return "127.0.0.1"
+	}
+	if h := u.Hostname(); h != "" && net.ParseIP(h) != nil {
+		return h
+	}
+	return "127.0.0.1"
+}
+
+// awaitPodCIDR resolves the pod CIDR to allocate from: the -pod-cidr flag
+// when given, otherwise spec.podCIDR, which the controller manager's CIDR
+// allocator writes once the node registers.
+func (a *Agent) awaitPodCIDR(ctx context.Context) error {
+	if a.cfg.PodCIDR != "" {
+		if _, err := netip.ParsePrefix(a.cfg.PodCIDR); err != nil {
+			return fmt.Errorf("pod CIDR %s: %w", a.cfg.PodCIDR, err)
+		}
+		return nil
+	}
+	n, err := a.cs.CoreV1().Nodes().Get(ctx, a.cfg.Name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if n.Spec.PodCIDR == "" {
+		return fmt.Errorf("node %s has no spec.podCIDR yet", a.cfg.Name)
+	}
+	if _, err := netip.ParsePrefix(n.Spec.PodCIDR); err != nil {
+		return fmt.Errorf("spec.podCIDR %s: %w", n.Spec.PodCIDR, err)
+	}
+	a.cfg.PodCIDR = n.Spec.PodCIDR
+	return nil
 }
 
 func (a *Agent) updateStatus(ctx context.Context) error {

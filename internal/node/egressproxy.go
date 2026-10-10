@@ -38,11 +38,14 @@ type egressProxy struct {
 	gw      *hull.Gateway
 	svcCIDR netip.Prefix
 	podCIDR netip.Prefix
+	// nodeIP is this node's InternalIP, dialed directly like loopback.
+	nodeIP netip.Addr
 }
 
 // serveEgressProxy answers CONNECT until ctx ends.
-func serveEgressProxy(ctx context.Context, sockPath string, gw *hull.Gateway, svcCIDR, podCIDR netip.Prefix) error {
-	p := &egressProxy{gw: gw, svcCIDR: svcCIDR, podCIDR: podCIDR}
+func serveEgressProxy(ctx context.Context, sockPath string, gw *hull.Gateway, svcCIDR, podCIDR netip.Prefix, nodeIP string) error {
+	ip, _ := netip.ParseAddr(nodeIP)
+	p := &egressProxy{gw: gw, svcCIDR: svcCIDR, podCIDR: podCIDR, nodeIP: ip}
 	srv := &http.Server{Handler: p, ReadHeaderTimeout: 10 * time.Second}
 	_ = os.Remove(sockPath)
 	ln, err := net.Listen("unix", sockPath)
@@ -89,15 +92,16 @@ func (p *egressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var dst net.Conn
 	var fwd hull.Forward
 	switch {
-	case ip.IsLoopback():
+	case ip.IsLoopback() || ip == p.nodeIP:
 		// The apiserver's own dials, such as the kubelet server, pass
 		// through the cluster selection in 1.37 and stay on the host.
 		dst, err = net.DialTimeout("tcp", r.URL.Host, 5*time.Second)
 	case p.svcCIDR.Contains(ip) || p.podCIDR.Contains(ip):
 		dst, fwd, err = p.forward(r.URL.Host)
 	default:
-		fmt.Fprintf(client, "HTTP/1.1 403 Forbidden\r\n\r\n")
-		return
+		// Anything else, such as another node's kubelet, is a host
+		// address: dial it directly.
+		dst, err = net.DialTimeout("tcp", r.URL.Host, 5*time.Second)
 	}
 	if err != nil || dst == nil {
 		log.Printf("egress proxy: %s: %v", r.URL.Host, err)
