@@ -34,12 +34,11 @@ import (
 // it, Sonobuoy's `retrieve` among them.
 type spdyExecutor struct {
 	sock string
-	env  []string
 }
 
 func (e spdyExecutor) ExecInContainer(ctx context.Context, _, _, container string, cmd []string,
 	in io.Reader, out, errw io.WriteCloser, tty bool, resize <-chan remotecommand.TerminalSize, _ time.Duration) error {
-	req := hull.OpenRequest{Argv: cmd, Env: e.env, TTY: tty, Rows: 24, Cols: 80}
+	req := hull.OpenRequest{Argv: guestExec(container, cmd), TTY: tty, Rows: 24, Cols: 80}
 	if tty && resize != nil {
 		select {
 		case sz, ok := <-resize:
@@ -85,12 +84,12 @@ func (e spdyExecutor) ExecInContainer(ctx context.Context, _, _, container strin
 }
 
 // execSPDY serves an exec request that asks for a SPDY upgrade.
-func execSPDY(w http.ResponseWriter, r *http.Request, sock, pod, uid, container string, argv, env []string) {
+func execSPDY(w http.ResponseWriter, r *http.Request, sock, pod, uid, container string, argv []string) {
 	opts, err := remotecommand.NewOptions(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	remotecommand.ServeExec(w, r, spdyExecutor{sock: sock, env: env}, pod, uid, container, argv, opts,
+	remotecommand.ServeExec(w, r, spdyExecutor{sock: sock}, pod, uid, container, argv, opts,
 		execIdleTimeout, remotecommand.DefaultStreamCreationTimeout, remotecommand.SupportedStreamingProtocols)
 }

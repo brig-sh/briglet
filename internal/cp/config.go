@@ -69,6 +69,8 @@ type Paths struct {
 	Pods string
 	// IPAM is the pod address allocation file.
 	IPAM string
+	// GuestBin holds the briglet-guest copy every pod VM shares.
+	GuestBin string
 }
 
 // StateDir returns the briglet state directory: $BRIGLET_STATE_DIR or ~/.briglet.
@@ -102,6 +104,7 @@ func NewPaths() (Paths, error) {
 		GatewayAPI:      filepath.Join(root, "gw.sock.api"),
 		Pods:            filepath.Join(root, "pods"),
 		IPAM:            filepath.Join(root, "ipam.json"),
+		GuestBin:        filepath.Join(root, "guest-bin"),
 	}, nil
 }
 

@@ -162,7 +162,6 @@ func RunArgs(s RunSpec) []string {
 		"--net", "shared",
 		"--gateway-sock", s.GatewaySock,
 		"--gateway-cidr", s.GatewayCIDR,
-		"--wait-ip",
 		"--mem", strconv.Itoa(s.MemMB),
 		"--cpus", strconv.Itoa(s.CPUs),
 		"--pull", s.Pull,
@@ -185,7 +184,9 @@ func RunArgs(s RunSpec) []string {
 	return append(args, s.Argv...)
 }
 
-// Run boots an instance and waits until the guest holds its address. It
+// Run boots an instance and returns as soon as the VMM is up. The guest
+// address is static, so there is no lease to wait for; with --wait-ip hull
+// would poll the gateway leases for its whole 5 s budget on every boot. It
 // returns the instance id hull prints.
 func (c *Client) Run(ctx context.Context, s RunSpec) (string, error) {
 	args := RunArgs(s)

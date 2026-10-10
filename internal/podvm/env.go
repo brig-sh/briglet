@@ -226,36 +226,3 @@ func Pairs(env []EnvVar) []string {
 	}
 	return out
 }
-
-// hullReads lists the names hull reads from its own environment. A value
-// for one of them cannot travel in hull's environment without changing what
-// hull does.
-func hullReads(name string) bool {
-	switch name {
-	case "HOME", "PATH", "TMPDIR":
-		return true
-	}
-	return strings.HasPrefix(name, "XDG_") || strings.HasPrefix(name, "HULL_")
-}
-
-// HullEnv splits the environment into the values that may go on the hull
-// command line as KEY=VALUE and the secret ones, which go in hull's own
-// process environment and are named on the command line by key only. hull
-// writes the guest environment one variable per line, so a value with a
-// newline is refused.
-func HullEnv(env []EnvVar) (plain, secret []string, err error) {
-	for _, v := range env {
-		if strings.ContainsAny(v.Value, "\n\r") {
-			return nil, nil, fmt.Errorf("env %s: hull passes the environment one variable per line, so a value with a newline cannot be passed", v.Name)
-		}
-		if !v.Secret {
-			plain = append(plain, v.Name+"="+v.Value)
-			continue
-		}
-		if hullReads(v.Name) {
-			return nil, nil, fmt.Errorf("env %s: a Secret value cannot be passed under a name hull reads for itself", v.Name)
-		}
-		secret = append(secret, v.Name+"="+v.Value)
-	}
-	return plain, secret, nil
-}

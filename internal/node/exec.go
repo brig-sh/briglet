@@ -26,6 +26,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/streaming/pkg/httpstream/wsstream"
 
+	"github.com/brig-sh/briglet/internal/guest"
 	"github.com/brig-sh/briglet/internal/hull"
 )
 
@@ -69,16 +70,16 @@ func (s *kubeletServer) exec(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "you must specify at least 1 of stdin, stdout, stderr", http.StatusBadRequest)
 		return
 	}
-	_, st, ok := s.lookup(w, r)
+	_, st, c, ok := s.lookup(w, r)
 	if !ok {
 		return
 	}
-	if !st.Running {
-		http.Error(w, fmt.Sprintf("container %s is not running", st.Container), http.StatusBadRequest)
+	if g := st.Guest.Find(c.Name); !st.Running || g == nil || g.State != guest.StateRunning {
+		http.Error(w, fmt.Sprintf("container %s is not running", c.Name), http.StatusBadRequest)
 		return
 	}
 	if !wsstream.IsWebSocketRequest(r) {
-		execSPDY(w, r, s.pm.hull.AgentSocket(st.Instance), r.PathValue("pod"), r.PathValue("uid"), st.Container, argv, st.Env)
+		execSPDY(w, r, s.pm.hull.AgentSocket(st.Instance), r.PathValue("pod"), r.PathValue("uid"), c.Name, argv)
 		return
 	}
 
@@ -137,7 +138,9 @@ func (s *kubeletServer) exec(w http.ResponseWriter, r *http.Request) {
 			}
 		}()
 	}
-	req := hull.OpenRequest{Argv: argv, Env: st.Env, TTY: tty, Rows: 24, Cols: 80}
+	// The guest helper takes the container's env, user and working
+	// directory from pod.json.
+	req := hull.OpenRequest{Argv: guestExec(c.Name, argv), TTY: tty, Rows: 24, Cols: 80}
 	if tty {
 		// kubectl sends the terminal size right after the upgrade.
 		select {
@@ -174,7 +177,7 @@ func (s *kubeletServer) exec(w http.ResponseWriter, r *http.Request) {
 		errw = streams[chanStderr]
 	}
 	code, err := sess.Wait(out, errw)
-	log.Printf("exec: %s %q exited %d (protocol %q)", st.Instance, argv, code, proto)
+	log.Printf("exec: %s %s %q exited %d (protocol %q)", st.Instance, c.Name, argv, code, proto)
 	writeExecStatus(streams[chanError], proto, code, err)
 }
 

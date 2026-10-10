@@ -15,8 +15,6 @@
 package node
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -27,18 +25,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"math/big"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/brig-sh/briglet/internal/guest"
 )
 
 // apiserverClientCN is the subject of the client cert the apiserver uses
@@ -138,127 +138,98 @@ func (s *kubeletServer) pods(w http.ResponseWriter, _ *http.Request) {
 	_ = json.NewEncoder(w).Encode(&list)
 }
 
-// lookup finds the pod's worker and checks the container name.
-func (s *kubeletServer) lookup(w http.ResponseWriter, r *http.Request) (*podWorker, podState, bool) {
+// lookup finds the pod's worker and the named container, an init
+// container included.
+func (s *kubeletServer) lookup(w http.ResponseWriter, r *http.Request) (*podWorker, podState, *corev1.Container, bool) {
 	ns, name, container := r.PathValue("ns"), r.PathValue("pod"), r.PathValue("container")
 	pw := s.pm.find(ns, name)
 	if pw == nil {
 		http.Error(w, fmt.Sprintf("pod %s/%s not found on this node", ns, name), http.StatusNotFound)
-		return nil, podState{}, false
+		return nil, podState{}, nil, false
 	}
-	st := pw.snapshot()
-	if container != st.Container {
+	pod, _ := pw.current()
+	c := containerOf(pod, container)
+	if c == nil {
 		http.Error(w, fmt.Sprintf("container %s is not valid for pod %s", container, name), http.StatusNotFound)
-		return nil, podState{}, false
+		return nil, podState{}, nil, false
 	}
-	if !st.Created {
-		http.Error(w, fmt.Sprintf("container %q in pod %q is waiting to start", container, name), http.StatusBadRequest)
-		return nil, podState{}, false
-	}
-	return pw, st, true
+	return pw, pw.snapshot(), c, true
 }
 
-// kernelLine matches console output that is not the container's: kernel
+// kernelLine matches console output that is not a container's: kernel
 // messages, the VMM's own lines, and hull's stop notice.
 var kernelLine = regexp.MustCompile(`^(\[\s*\d+\.\d+\] |\[hvi\] |guest stopped: |booting \S+/boot-kernel with )`)
 
-// lineFilter drops kernelLine lines from a stream and flushes after each
-// write when the destination can flush.
-type lineFilter struct {
-	w       io.Writer
-	partial []byte
-	flush   func()
-}
-
-func (f *lineFilter) Write(p []byte) (int, error) {
-	f.partial = append(f.partial, p...)
-	for {
-		i := bytes.IndexByte(f.partial, '\n')
-		if i < 0 {
-			break
-		}
-		line := f.partial[:i+1]
-		if !kernelLine.Match(line) {
-			if _, err := f.w.Write(line); err != nil {
-				return 0, err
-			}
-		}
-		f.partial = f.partial[i+1:]
-	}
-	if f.flush != nil {
-		f.flush()
-	}
-	return len(p), nil
-}
-
-func (f *lineFilter) Close() {
-	if len(f.partial) > 0 && !kernelLine.Match(f.partial) {
-		_, _ = f.w.Write(f.partial)
-	}
-	f.partial = nil
-}
-
-// containerLogs serves the VM console through `hull logs`, without kernel
-// and VMM lines. follow and tailLines are honored; timestamps, previous,
-// sinceSeconds and limitBytes are ignored. With follow, tailLines counts
-// console lines before the filter.
+// containerLogs serves a container's log file, which the guest supervisor
+// writes in the CRI format into the pod's guest directory. follow,
+// tailLines, timestamps, previous, sinceSeconds, sinceTime and limitBytes
+// are honored as the kubelet honors them.
 func (s *kubeletServer) containerLogs(w http.ResponseWriter, r *http.Request) {
-	_, st, ok := s.lookup(w, r)
+	pw, st, c, ok := s.lookup(w, r)
 	if !ok {
 		return
 	}
 	q := r.URL.Query()
-	follow := q.Get("follow") == "true" || q.Get("follow") == "1"
-	tail := -1
-	if v := q.Get("tailLines"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 0 {
-			http.Error(w, "tailLines must be a non-negative integer", http.StatusBadRequest)
-			return
-		}
-		tail = n
+	opts := logOptions{
+		follow:     q.Get("follow") == "true" || q.Get("follow") == "1",
+		timestamps: q.Get("timestamps") == "true" || q.Get("timestamps") == "1",
+		tail:       -1,
+		limit:      -1,
 	}
-	w.Header().Set("Content-Type", "text/plain")
-	if !follow {
-		var buf bytes.Buffer
-		f := &lineFilter{w: &buf}
-		if err := s.pm.hull.Logs(r.Context(), st.Instance, false, -1, f); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+	previous := q.Get("previous") == "true" || q.Get("previous") == "1"
+	for name, dst := range map[string]*int64{"tailLines": &opts.tail, "limitBytes": &opts.limit, "sinceSeconds": nil} {
+		v := q.Get(name)
+		if v == "" {
+			continue
+		}
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 0 {
+			http.Error(w, name+" must be a non-negative integer", http.StatusBadRequest)
 			return
 		}
-		f.Close()
-		_, _ = w.Write(lastN(buf.Bytes(), tail))
+		if dst != nil {
+			*dst = n
+		} else {
+			opts.since = time.Now().Add(-time.Duration(n) * time.Second)
+		}
+	}
+	if v := q.Get("sinceTime"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			http.Error(w, "sinceTime must be RFC 3339", http.StatusBadRequest)
+			return
+		}
+		opts.since = t
+	}
+	path := filepath.Join(pw.podDirs().Guest, "logs", c.Name+".log")
+	if previous {
+		path += ".1"
+		opts.follow = false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		switch {
+		case previous:
+			http.Error(w, fmt.Sprintf("previous terminated container %q in pod %q not found", c.Name, st.Name), http.StatusBadRequest)
+		default:
+			reason := "ContainerCreating"
+			if st.Waiting != nil {
+				reason = st.Waiting.Reason
+			}
+			http.Error(w, fmt.Sprintf("container %q in pod %q is waiting to start: %s", c.Name, st.Name, reason), http.StatusBadRequest)
+		}
 		return
 	}
-	fl, _ := w.(http.Flusher)
-	f := &lineFilter{w: w}
-	if fl != nil {
-		f.flush = fl.Flush
-		fl.Flush()
+	defer f.Close()
+	w.Header().Set("Content-Type", "text/plain")
+	running := func() bool {
+		cur := pw.snapshot()
+		g := cur.Guest.Find(c.Name)
+		return cur.Running && g != nil && g.State == guest.StateRunning
 	}
-	if err := s.pm.hull.Logs(r.Context(), st.Instance, true, tail, f); err != nil {
-		log.Printf("logs %s: %v", st.Instance, err)
+	if err := copyLogs(r.Context(), f, w, opts, running); err != nil {
+		log.Printf("logs %s/%s %s: %v", st.Namespace, st.Name, c.Name, err)
 	}
-	f.Close()
-}
-
-func lastN(b []byte, n int) []byte {
-	if n < 0 {
-		return b
-	}
-	if n == 0 {
-		return nil
-	}
-	sc := bufio.NewScanner(bytes.NewReader(b))
-	sc.Buffer(make([]byte, 64<<10), 4<<20)
-	var lines [][]byte
-	for sc.Scan() {
-		lines = append(lines, append(append([]byte(nil), sc.Bytes()...), '\n'))
-	}
-	if len(lines) > n {
-		lines = lines[len(lines)-n:]
-	}
-	return bytes.Join(lines, nil)
 }
 
 func selfSigned(nodeName string) (tls.Certificate, error) {

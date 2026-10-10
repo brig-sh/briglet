@@ -192,10 +192,13 @@ func downwardFiles(out map[string]FileProjection, pod *corev1.Pod, items []corev
 }
 
 func containerNamed(pod *corev1.Pod, name string) *corev1.Container {
-	for i := range pod.Spec.Containers {
-		if name == "" || pod.Spec.Containers[i].Name == name {
-			return &pod.Spec.Containers[i]
+	for _, c := range AllContainers(pod) {
+		if c.Name == name {
+			return c
 		}
+	}
+	if name == "" && len(pod.Spec.Containers) > 0 {
+		return &pod.Spec.Containers[0]
 	}
 	return nil
 }
@@ -266,14 +269,9 @@ func unsupportedVolumes(pod *corev1.Pod) []string {
 			why = append(why, fmt.Sprintf("volume %s of type %s", v.Name, volumeType(v)))
 		}
 	}
-	for _, c := range pod.Spec.Containers {
+	for _, c := range AllContainers(pod) {
 		if len(c.VolumeDevices) > 0 {
 			why = append(why, "volumeDevices")
-		}
-		for _, m := range c.VolumeMounts {
-			if strings.ContainsAny(m.MountPath, " \t'\"") {
-				why = append(why, fmt.Sprintf("mountPath %q with spaces or quotes", m.MountPath))
-			}
 		}
 	}
 	return why

@@ -58,7 +58,9 @@ type Component struct {
 
 // Cluster is the full set of components in start order.
 type Cluster struct {
-	Paths      Paths
+	Paths Paths
+	// Self is the briglet executable; bin/briglet-guest sits next to it.
+	Self       string
 	NodeName   string
 	Hull       *hull.Client
 	Components []*Component
@@ -90,7 +92,7 @@ func NewCluster() (*Cluster, error) {
 		return nil, err
 	}
 	pki := func(f string) string { return filepath.Join(p.PKI, f) }
-	c := &Cluster{Paths: p, NodeName: name, Hull: hull.New(hullBin, p.HullStore)}
+	c := &Cluster{Paths: p, Self: self, NodeName: name, Hull: hull.New(hullBin, p.HullStore)}
 
 	etcd := NewProc(p, "etcd", bins.Etcd,
 		"--name=briglet",
@@ -126,6 +128,13 @@ func NewCluster() (*Cluster, error) {
 		"--enable-admission-plugins=NodeRestriction",
 		"--enable-bootstrap-token-auth=true",
 		"--service-account-issuer="+SAIssuer,
+		// Every pod is a VM, so a privileged container stays inside its
+		// guest; the guest supervisor honors the flag.
+		"--allow-privileged=true",
+		// The discovery document would otherwise name the advertise address,
+		// 10.87.0.1:6443, which no pod can dial: the apiserver runs on the
+		// Mac and only the kubernetes Service reaches it.
+		"--service-account-jwks-uri="+SAIssuer+"/openid/v1/jwks",
 		"--service-account-key-file="+pki("sa.pub"),
 		"--service-account-signing-key-file="+pki("sa.key"),
 		"--kubelet-client-certificate="+pki("apiserver-kubelet-client.crt"),
@@ -208,7 +217,7 @@ func NewCluster() (*Cluster, error) {
 		}},
 		{Proc: gateway, Health: gwAPI.Healthy, BeforeStart: c.clearGatewaySockets, BeforeStop: c.removeInstances,
 			Preflight: c.checkGatewayServices},
-		{Proc: node, Port: KubeletPort, Health: func(ctx context.Context) error {
+		{Proc: node, Port: KubeletPort, Preflight: c.prepareGuestBinary, Health: func(ctx context.Context) error {
 			if _, err := c.get(ctx, fmt.Sprintf("https://127.0.0.1:%d/healthz", KubeletPort), "apiserver-kubelet-client"); err != nil {
 				return err
 			}

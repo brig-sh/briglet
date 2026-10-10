@@ -25,7 +25,7 @@ import (
 func TestProbeDue(t *testing.T) {
 	start := time.Unix(1000, 0)
 	ps := probeSpec{probeLiveness, &corev1.Probe{InitialDelaySeconds: 5, PeriodSeconds: 7}}
-	st := &podState{StartedAt: start}
+	st := &ctrState{Run: start}
 	if got := probeDue(ps, st); !got.Equal(start.Add(5 * time.Second)) {
 		t.Errorf("first due = %v", got)
 	}
@@ -42,7 +42,7 @@ func TestProbeDue(t *testing.T) {
 
 func TestInitialProbeState(t *testing.T) {
 	c := &corev1.Container{}
-	st := &podState{Probes: map[string]*probeState{probeLiveness: {Failures: 2}}}
+	st := &ctrState{Probes: map[string]*probeState{probeLiveness: {Failures: 2}}}
 	initialProbeState(c, st)
 	if !st.Started || !st.Ready || st.Probes != nil {
 		t.Errorf("no probes: %+v", st)

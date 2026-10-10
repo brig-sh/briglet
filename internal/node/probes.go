@@ -31,7 +31,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
+	"github.com/brig-sh/briglet/internal/guest"
 	"github.com/brig-sh/briglet/internal/hull"
+	"github.com/brig-sh/briglet/internal/podvm"
 )
 
 const (
@@ -79,10 +81,10 @@ func threshold(v, def int32) int32 {
 
 // probeDue is when the probe runs next: initialDelaySeconds after the
 // container started, then every periodSeconds.
-func probeDue(ps probeSpec, st *podState) time.Time {
-	first := st.StartedAt.Add(time.Duration(ps.p.InitialDelaySeconds) * time.Second)
-	last := st.Probes[ps.kind]
-	if last == nil || last.LastAt.Before(st.StartedAt) {
+func probeDue(ps probeSpec, cst *ctrState) time.Time {
+	first := cst.Run.Add(time.Duration(ps.p.InitialDelaySeconds) * time.Second)
+	last := cst.Probes[ps.kind]
+	if last == nil || last.LastAt.Before(cst.Run) {
 		return first
 	}
 	next := last.LastAt.Add(seconds(ps.p.PeriodSeconds, 10))
@@ -95,41 +97,71 @@ func probeDue(ps probeSpec, st *podState) time.Time {
 // initialProbeState is the startup and readiness state of a container that
 // just started: started unless a startup probe gates it, ready only when
 // started and no readiness probe decides.
-func initialProbeState(c *corev1.Container, st *podState) {
-	st.Probes = nil
-	st.Started = c.StartupProbe == nil
-	st.Ready = st.Started && c.ReadinessProbe == nil
+func initialProbeState(c *corev1.Container, cst *ctrState) {
+	cst.Probes = nil
+	cst.Started = c.StartupProbe == nil
+	cst.Ready = cst.Started && c.ReadinessProbe == nil
 }
 
-// probe runs the probes that are due. It returns why the container must be
-// killed, if a startup or liveness probe failed, whether the startup or
-// readiness state changed, and when the next probe is due.
-func (w *podWorker) probe(ctx context.Context, pod *corev1.Pod, now time.Time) (kill string, changed bool, next time.Time) {
-	c := &pod.Spec.Containers[0]
-	for _, ps := range probesOf(c) {
+// probe runs the probes that are due in every running container. A startup
+// or liveness probe at its failure threshold restarts that container
+// through the supervisor. It reports whether a startup or readiness state
+// changed, and when the next probe is due.
+func (w *podWorker) probe(ctx context.Context, pod *corev1.Pod, now time.Time) (changed bool, next time.Time) {
+	for _, c := range podvm.AllContainers(pod) {
+		probes := probesOf(c)
+		if len(probes) == 0 {
+			continue
+		}
 		st := w.snapshot()
-		if (ps.kind == probeStartup) == st.Started {
+		cs := st.Guest.Find(c.Name)
+		cst := st.Containers[c.Name]
+		if cs == nil || cs.State != guest.StateRunning || cst == nil || !cst.Run.Equal(cs.StartedAt) {
+			continue
+		}
+		ch, n, kill := w.probeContainer(ctx, c, probes, now)
+		changed = changed || ch
+		next = earliest(next, n)
+		if kill != "" {
+			w.restartContainer(ctx, pod, c, kill)
+		}
+		if ctx.Err() != nil || w.stopping() {
+			return changed, next
+		}
+	}
+	return changed, next
+}
+
+func (w *podWorker) probeContainer(ctx context.Context, c *corev1.Container, probes []probeSpec, now time.Time) (changed bool, next time.Time, kill string) {
+	for _, ps := range probes {
+		st := w.snapshot()
+		cst := st.Containers[c.Name]
+		if cst == nil {
+			return changed, next, ""
+		}
+		if (ps.kind == probeStartup) == cst.Started {
 			// The startup probe runs until it passes; the others after.
 			continue
 		}
-		due := probeDue(ps, &st)
+		due := probeDue(ps, cst)
 		if now.Before(due) {
 			next = earliest(next, due)
 			continue
 		}
 		ok, msg := w.runProbe(ctx, c, &st, ps.p)
 		if ctx.Err() != nil || w.stopping() {
-			return "", false, next
+			return changed, next, ""
 		}
 		var failures int32
 		w.set(func(st *podState) {
-			if st.Probes == nil {
-				st.Probes = map[string]*probeState{}
+			cst := st.ctr(c.Name)
+			if cst.Probes == nil {
+				cst.Probes = map[string]*probeState{}
 			}
-			r := st.Probes[ps.kind]
+			r := cst.Probes[ps.kind]
 			if r == nil {
 				r = &probeState{}
-				st.Probes[ps.kind] = r
+				cst.Probes[ps.kind] = r
 			}
 			r.LastAt = time.Now()
 			if ok {
@@ -142,22 +174,22 @@ func (w *podWorker) probe(ctx context.Context, pod *corev1.Pod, now time.Time) (
 				r.Result, r.Message = "failure", msg
 			}
 			failures = r.Failures
-			wasStarted, wasReady := st.Started, st.Ready
+			wasStarted, wasReady := cst.Started, cst.Ready
 			switch ps.kind {
 			case probeStartup:
 				if ok {
-					st.Started = true
-					st.Ready = c.ReadinessProbe == nil
+					cst.Started = true
+					cst.Ready = c.ReadinessProbe == nil
 				}
 			case probeReadiness:
 				if ok && r.Successes >= threshold(ps.p.SuccessThreshold, 1) {
-					st.Ready = true
+					cst.Ready = true
 				}
 				if !ok && r.Failures >= threshold(ps.p.FailureThreshold, 3) {
-					st.Ready = false
+					cst.Ready = false
 				}
 			}
-			changed = changed || st.Started != wasStarted || st.Ready != wasReady
+			changed = changed || cst.Started != wasStarted || cst.Ready != wasReady
 		})
 		next = earliest(next, time.Now().Add(seconds(ps.p.PeriodSeconds, 10)))
 		if ok {
@@ -165,16 +197,40 @@ func (w *podWorker) probe(ctx context.Context, pod *corev1.Pod, now time.Time) (
 		}
 		kind := strings.ToUpper(ps.kind[:1]) + ps.kind[1:]
 		w.event(corev1.EventTypeWarning, "Unhealthy", "%s probe failed: %s", kind, msg)
-		w.logf("%s probe failed (%d in a row): %s", ps.kind, failures, msg)
+		w.logf("%s probe of %s failed (%d in a row): %s", ps.kind, c.Name, failures, msg)
 		if ps.kind != probeReadiness && failures >= threshold(ps.p.FailureThreshold, 3) {
 			w.event(corev1.EventTypeNormal, "Killing", "Container %s failed %s probe, will be restarted", c.Name, ps.kind)
-			return ps.kind, changed, next
+			return changed, next, ps.kind
 		}
 	}
-	return "", changed, next
+	return changed, next, ""
+}
+
+// restartContainer has the supervisor stop a container whose startup or
+// liveness probe failed, with the probe's terminationGracePeriodSeconds or
+// the pod's. The restart policy decides what follows, in the guest.
+func (w *podWorker) restartContainer(ctx context.Context, pod *corev1.Pod, c *corev1.Container, kind string) {
+	grace := podvm.GraceSeconds(pod)
+	for _, ps := range probesOf(c) {
+		if ps.kind == kind && ps.p.TerminationGracePeriodSeconds != nil {
+			grace = int(*ps.p.TerminationGracePeriodSeconds)
+		}
+	}
+	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if err := w.ctl(cctx, guest.CtlRequest{Op: guest.CtlRestart, Container: c.Name, Grace: grace}); err != nil {
+		w.logf("restart %s after the %s probe failed: %v", c.Name, kind, err)
+		return
+	}
+	// Probes wait for the next run.
+	w.set(func(st *podState) { st.ctr(c.Name).Run = time.Time{} })
+	w.logf("asked the supervisor to restart %s after the %s probe failed (grace %d s)", c.Name, kind, grace)
 }
 
 func earliest(a, b time.Time) time.Time {
+	if b.IsZero() {
+		return a
+	}
 	if a.IsZero() || b.Before(a) {
 		return b
 	}
@@ -188,23 +244,21 @@ func (w *podWorker) runProbe(ctx context.Context, c *corev1.Container, st *podSt
 	defer cancel()
 	switch {
 	case p.Exec != nil:
-		return w.execProbe(pctx, st, p.Exec.Command, timeout)
+		return w.execProbe(pctx, c.Name, st, p.Exec.Command, timeout)
 	case p.HTTPGet != nil:
 		return w.httpProbe(pctx, c, st, p.HTTPGet)
 	case p.TCPSocket != nil:
 		return w.tcpProbe(pctx, c, st, p.TCPSocket.Port)
 	case p.GRPC != nil:
-		// gRPC health checking is not implemented; the port is probed over
-		// TCP instead, and the pod got an event saying so at start.
-		return w.tcpProbe(pctx, c, st, intstr.FromInt32(p.GRPC.Port))
+		return w.grpcProbe(pctx, st, p.GRPC)
 	}
 	return false, "probe has no handler"
 }
 
-// execProbe runs the command through the guest agent with the container
-// env. Exit 0 is success.
-func (w *podWorker) execProbe(ctx context.Context, st *podState, argv []string, timeout time.Duration) (bool, string) {
-	sess, err := hull.DialAgent(ctx, w.m.hull.AgentSocket(st.Instance), hull.OpenRequest{Argv: argv, Env: st.Env})
+// execProbe runs the command in the container through the guest agent and
+// briglet-guest exec, with the container's env. Exit 0 is success.
+func (w *podWorker) execProbe(ctx context.Context, container string, st *podState, argv []string, timeout time.Duration) (bool, string) {
+	sess, err := hull.DialAgent(ctx, w.m.hull.AgentSocket(st.Instance), hull.OpenRequest{Argv: guestExec(container, argv)})
 	if err != nil {
 		return false, err.Error()
 	}
@@ -317,7 +371,7 @@ func resolvePort(p intstr.IntOrString, c *corev1.Container) (int32, error) {
 }
 
 // probePorts lists the ports that get a gateway forward: every TCP
-// container port and every httpGet probe port.
+// container port and every httpGet and gRPC probe port.
 func probePorts(c *corev1.Container) []int32 {
 	seen := map[int32]bool{}
 	var out []int32
@@ -338,15 +392,27 @@ func probePorts(c *corev1.Container) []int32 {
 				add(p)
 			}
 		}
+		if ps.p.GRPC != nil {
+			add(ps.p.GRPC.Port)
+		}
 	}
 	return out
 }
 
 // ensureForwards makes the gateway forward an ephemeral 127.0.0.1 port to
-// each of the container's ports, keeping the local ports the state already
-// names.
-func (w *podWorker) ensureForwards(ctx context.Context, c *corev1.Container) {
-	ports := probePorts(c)
+// each port of the pod's containers, keeping the local ports the state
+// already names.
+func (w *podWorker) ensureForwards(ctx context.Context, pod *corev1.Pod) {
+	var ports []int32
+	seen := map[int32]bool{}
+	for _, c := range podvm.AllContainers(pod) {
+		for _, p := range probePorts(c) {
+			if !seen[p] {
+				seen[p] = true
+				ports = append(ports, p)
+			}
+		}
+	}
 	if len(ports) == 0 {
 		return
 	}

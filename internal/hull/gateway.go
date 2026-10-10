@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -139,6 +140,11 @@ func (g *Gateway) ProbeTCP(ctx context.Context, addr string) (bool, error) {
 	case http.StatusBadRequest:
 		return false, statusErr("probe "+addr, body, status)
 	default:
+		// The gateway answers 503 for every failed dial. Only a refusal is
+		// one the pod gave; a dial that timed out carries its reason.
+		if msg := strings.TrimSpace(string(body)); msg != "" && !strings.Contains(msg, "refused") {
+			return false, errors.New(msg)
+		}
 		return false, nil
 	}
 }

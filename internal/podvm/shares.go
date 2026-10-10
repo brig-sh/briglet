@@ -22,33 +22,68 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 
+	"github.com/brig-sh/briglet/internal/guest"
 	"github.com/brig-sh/briglet/internal/hull"
 )
 
-// PodDirs are the host directories of one pod's volumes.
+// PodDirs are the host side of a pod's guest directory, which the VM
+// mounts read-write at guest.PodDir. Volumes live inside it, so they reach
+// the guest without a share of their own.
 type PodDirs struct {
-	// Volumes holds one directory per volume: <pod dir>/volumes/<name>.
+	// Guest is the pod's guest directory.
+	Guest string
+	// Volumes holds one directory per volume: <guest>/volumes/<name>.
 	Volumes string
-	// Subpath holds what subPath mounts share: copies out of atomically
-	// written volumes, and directories that carry a single file.
+	// Subpath holds what subPath mounts bind: copies out of atomically
+	// written volumes, and hostPath files.
 	Subpath string
+}
+
+// NewPodDirs lays out the guest directory of a pod under dir.
+func NewPodDirs(dir string) PodDirs {
+	g := filepath.Join(dir, "guest")
+	return PodDirs{Guest: g, Volumes: filepath.Join(g, "volumes"), Subpath: filepath.Join(g, "subpath")}
 }
 
 // VolumeDir is the host directory of a volume the agent provides.
 func (d PodDirs) VolumeDir(name string) string { return filepath.Join(d.Volumes, name) }
 
-// guardedParents are guest directories a file subPath mount must not cover:
-// a file subPath is shared as its parent directory, which hides the image's
-// files there.
-var guardedParents = map[string]bool{
-	"/": true, "/bin": true, "/sbin": true, "/lib": true, "/lib64": true, "/etc": true,
-	"/usr": true, "/usr/bin": true, "/usr/sbin": true, "/usr/lib": true, "/usr/local": true,
-	"/usr/local/bin": true, "/var": true, "/dev": true, "/proc": true, "/sys": true, "/run": true,
+// GuestPath maps a host path inside the guest directory to the path the
+// VM sees.
+func (d PodDirs) GuestPath(host string) string {
+	rel, err := filepath.Rel(d.Guest, host)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return ""
+	}
+	return path.Join(guest.PodDir, filepath.ToSlash(rel))
+}
+
+// HostShares collects the host directories outside the guest directory
+// that a pod's VM needs: hostPath volumes. One share serves every mount
+// of the same directory.
+type HostShares struct {
+	Shares []hull.Share
+	byHost map[string]int
+}
+
+// Add shares host and returns its guest path. A share is read-only only
+// while every mount of it is.
+func (h *HostShares) Add(host string, ro bool) string {
+	if h.byHost == nil {
+		h.byHost = map[string]int{}
+	}
+	if i, ok := h.byHost[host]; ok {
+		h.Shares[i].ReadOnly = h.Shares[i].ReadOnly && ro
+		return h.Shares[i].Guest
+	}
+	g := fmt.Sprintf("%s/host/%d", guest.PodDir, len(h.Shares))
+	h.byHost[host] = len(h.Shares)
+	h.Shares = append(h.Shares, hull.Share{Host: host, Guest: g, ReadOnly: ro})
+	return g
 }
 
 // PrepareVolumes creates the directories of emptyDir and hostPath volumes.
@@ -111,15 +146,15 @@ func prepareHostPath(v *corev1.Volume) error {
 	return nil
 }
 
-// Shares maps the container's volumeMounts to hull shares. A mount without
-// subPath shares the volume's directory. A directory subPath shares that
-// directory, created when missing as the kubelet does. A file subPath, and a
-// hostPath that names a file, shares a directory that holds only that file
-// (a hard link, or a copy across file systems) at the mount's parent
-// directory, so the guest sees no other file of the image in that parent.
-// A subPath into an atomically written volume is a copy taken now, which
-// later updates do not reach; the kubelet's bind mount behaves the same.
-func Shares(pod *corev1.Pod, c *corev1.Container, dirs PodDirs, env []EnvVar) ([]hull.Share, error) {
+// Mounts maps the volumeMounts of container index ci to guest bind mounts.
+// emptyDir and the atomically written volumes are directories inside the
+// guest directory; a hostPath directory becomes a share in hs. The guest
+// binds files as well as directories, so a subPath binds exactly what it
+// names. A subPath into an atomically written volume binds a copy taken
+// now, which later updates do not reach; the kubelet's bind mount behaves
+// the same. A hostPath file is hard-linked (or copied, across file
+// systems) into the guest directory.
+func Mounts(pod *corev1.Pod, c *corev1.Container, ci int, dirs PodDirs, env []EnvVar, hs *HostShares) ([]guest.Mount, error) {
 	vols := map[string]*corev1.Volume{}
 	for i := range pod.Spec.Volumes {
 		vols[pod.Spec.Volumes[i].Name] = &pod.Spec.Volumes[i]
@@ -128,33 +163,7 @@ func Shares(pod *corev1.Pod, c *corev1.Container, dirs PodDirs, env []EnvVar) ([
 	for _, v := range env {
 		vars[v.Name] = v.Value
 	}
-	if err := os.RemoveAll(dirs.Subpath); err != nil {
-		return nil, err
-	}
-	var shares []hull.Share
-	type fileGroup struct {
-		host string
-		ro   bool
-	}
-	groups := map[string]*fileGroup{}
-	var groupOrder []string
-	addFile := func(src, mountPath string, ro bool) error {
-		parent := path.Dir(mountPath)
-		if guardedParents[parent] {
-			return fmt.Errorf("mount %s: briglet shares a single file as its parent directory, and %s cannot be covered", mountPath, parent)
-		}
-		g := groups[parent]
-		if g == nil {
-			g = &fileGroup{host: filepath.Join(dirs.Subpath, "f"+strconv.Itoa(len(groups))), ro: true}
-			groups[parent] = g
-			groupOrder = append(groupOrder, parent)
-			if err := os.MkdirAll(g.host, 0o755); err != nil {
-				return err
-			}
-		}
-		g.ro = g.ro && ro
-		return linkOrCopy(src, filepath.Join(g.host, path.Base(mountPath)))
-	}
+	var out []guest.Mount
 	for i, m := range c.VolumeMounts {
 		v := vols[m.Name]
 		if v == nil {
@@ -163,10 +172,6 @@ func Shares(pod *corev1.Pod, c *corev1.Container, dirs PodDirs, env []EnvVar) ([
 		mountPath := path.Clean(m.MountPath)
 		atomic := Atomic(v)
 		ro := m.ReadOnly || atomic
-		base := dirs.VolumeDir(v.Name)
-		if v.HostPath != nil {
-			base = v.HostPath.Path
-		}
 		sub := m.SubPath
 		if m.SubPathExpr != "" {
 			sub = expand(m.SubPathExpr, vars)
@@ -176,16 +181,50 @@ func Shares(pod *corev1.Pod, c *corev1.Container, dirs PodDirs, env []EnvVar) ([
 			if path.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, "../") {
 				return nil, fmt.Errorf("mount %s: subPath %q must stay inside the volume", mountPath, sub)
 			}
+			sub = clean
 		}
-		src := base
-		if sub != "" {
-			src = filepath.Join(base, sub)
+		add := func(src string) { out = append(out, guest.Mount{Source: src, Destination: mountPath, ReadOnly: ro}) }
+		// An emptyDir of Memory medium becomes a tmpfs in the container,
+		// as the kubelet mounts it, not a share of the pod directory.
+		if v.EmptyDir != nil && v.EmptyDir.Medium == corev1.StorageMediumMemory && sub == "" {
+			out = append(out, guest.Mount{Destination: mountPath, ReadOnly: ro, Tmpfs: true, Volume: v.Name})
+			continue
 		}
-		if atomic && sub != "" {
+		copyDst := filepath.Join(dirs.Subpath, fmt.Sprintf("c%dm%d", ci, i))
+		switch {
+		case v.HostPath != nil:
+			src := v.HostPath.Path
+			if sub != "" {
+				src = filepath.Join(src, sub)
+			}
+			info, err := os.Stat(src)
+			if errors.Is(err, fs.ErrNotExist) && sub != "" {
+				if err = os.MkdirAll(src, 0o755); err == nil {
+					info, err = os.Stat(src)
+				}
+			}
+			if err != nil {
+				return nil, fmt.Errorf("mount %s: %w", mountPath, err)
+			}
+			if info.IsDir() {
+				if strings.ContainsAny(src, ": \t'\"") {
+					return nil, fmt.Errorf("mount %s: hull cannot share %q", mountPath, src)
+				}
+				add(hs.Add(src, ro))
+				continue
+			}
+			if err := os.MkdirAll(dirs.Subpath, 0o755); err != nil {
+				return nil, err
+			}
+			if err := linkOrCopy(src, copyDst); err != nil {
+				return nil, err
+			}
+			add(dirs.GuestPath(copyDst))
+		case atomic && sub != "":
 			// Follow ..data to the current timestamp directory and copy out
-			// of it, so the share does not depend on a directory the next
+			// of it, so the mount does not depend on a directory the next
 			// update retires.
-			real, err := filepath.EvalSymlinks(src)
+			real, err := filepath.EvalSymlinks(filepath.Join(dirs.VolumeDir(v.Name), sub))
 			if err != nil {
 				return nil, fmt.Errorf("mount %s: subPath %q: %w", mountPath, sub, err)
 			}
@@ -193,42 +232,32 @@ func Shares(pod *corev1.Pod, c *corev1.Container, dirs PodDirs, env []EnvVar) ([
 			if err != nil {
 				return nil, err
 			}
-			if !info.IsDir() {
-				if err := addFile(real, mountPath, ro); err != nil {
-					return nil, err
+			if err := os.MkdirAll(dirs.Subpath, 0o755); err != nil {
+				return nil, err
+			}
+			if info.IsDir() {
+				err = copyTree(real, copyDst)
+			} else {
+				err = copyFile(real, copyDst)
+			}
+			if err != nil {
+				return nil, err
+			}
+			add(dirs.GuestPath(copyDst))
+		default:
+			src := dirs.VolumeDir(v.Name)
+			if sub != "" {
+				src = filepath.Join(src, sub)
+				if _, err := os.Lstat(src); errors.Is(err, fs.ErrNotExist) {
+					if err := os.MkdirAll(src, 0o777); err != nil {
+						return nil, err
+					}
 				}
-				continue
 			}
-			dst := filepath.Join(dirs.Subpath, "d"+strconv.Itoa(i))
-			if err := copyTree(real, dst); err != nil {
-				return nil, err
-			}
-			shares = append(shares, hull.Share{Host: dst, Guest: mountPath, ReadOnly: ro})
-			continue
+			add(dirs.GuestPath(src))
 		}
-		info, err := os.Stat(src)
-		if errors.Is(err, fs.ErrNotExist) && sub != "" {
-			if err := os.MkdirAll(src, 0o755); err != nil {
-				return nil, err
-			}
-			info, err = os.Stat(src)
-		}
-		if err != nil {
-			return nil, fmt.Errorf("mount %s: %w", mountPath, err)
-		}
-		if !info.IsDir() {
-			if err := addFile(src, mountPath, ro); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		shares = append(shares, hull.Share{Host: src, Guest: mountPath, ReadOnly: ro})
 	}
-	for _, parent := range groupOrder {
-		g := groups[parent]
-		shares = append(shares, hull.Share{Host: g.host, Guest: parent, ReadOnly: g.ro})
-	}
-	return shares, nil
+	return out, nil
 }
 
 func linkOrCopy(src, dst string) error {

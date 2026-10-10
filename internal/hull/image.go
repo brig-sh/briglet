@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // Image is a pulled image as the store records it.
@@ -47,15 +48,48 @@ func (i *Image) ID() string {
 	return i.Digest
 }
 
-// LocalImage finds an image in the store pulled under exactly ref. The store
-// keeps images/<digest>/image.json; see pkg/store in hull.
+// NormalizeRef spells an image reference in full, as Docker does:
+// "busybox" is "docker.io/library/busybox:latest".
+func NormalizeRef(ref string) string {
+	name, digest, hasDigest := strings.Cut(ref, "@")
+	first, _, hasSlash := strings.Cut(name, "/")
+	if !hasSlash || (!strings.ContainsAny(first, ".:") && first != "localhost") {
+		if !hasSlash {
+			name = "library/" + name
+		}
+		name = "docker.io/" + name
+	}
+	if hasDigest {
+		return name + "@" + digest
+	}
+	if i := strings.LastIndexByte(name, ':'); i < 0 || strings.Contains(name[i:], "/") {
+		name += ":latest"
+	}
+	return name
+}
+
+// MirrorRef rewrites a Docker Hub reference to the same image on mirror, a
+// registry host that mirrors Docker Hub such as mirror.gcr.io. Other
+// references and an empty mirror leave ref as it is.
+func MirrorRef(ref, mirror string) string {
+	full := NormalizeRef(ref)
+	if mirror == "" || !strings.HasPrefix(full, "docker.io/") {
+		return ref
+	}
+	return strings.TrimSuffix(mirror, "/") + "/" + strings.TrimPrefix(full, "docker.io/")
+}
+
+// LocalImage finds an image in the store pulled under ref, comparing the
+// references in full. The store keeps images/<digest>/image.json; see
+// pkg/store in hull.
 func (c *Client) LocalImage(ref string) (*Image, bool) {
+	want := NormalizeRef(ref)
 	matches, _ := filepath.Glob(filepath.Join(c.StoreDir, "images", "*", "image.json"))
 	var found *Image
 	var newest os.FileInfo
 	for _, m := range matches {
 		img, err := readImage(m)
-		if err != nil || img.Ref != ref {
+		if err != nil || NormalizeRef(img.Ref) != want {
 			continue
 		}
 		if _, err := os.Stat(filepath.Join(filepath.Dir(m), "oci-config.json")); err != nil {

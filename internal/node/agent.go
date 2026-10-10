@@ -79,6 +79,13 @@ type Config struct {
 	ClusterDomain string
 	// Debug logs the full service table on each change.
 	Debug bool
+	// GuestBinDir holds the briglet-guest binary every pod VM runs.
+	GuestBinDir string
+	// BaseImage is the image every pod VM boots, busybox by default.
+	BaseImage string
+	// RegistryMirror is a registry host that mirrors Docker Hub, such as
+	// mirror.gcr.io. Docker Hub images are pulled from it when it is set.
+	RegistryMirror string
 }
 
 // Agent is a running node agent.

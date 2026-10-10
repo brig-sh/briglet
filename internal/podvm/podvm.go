@@ -35,6 +35,8 @@ const (
 const ReasonUnsupported = "Unsupported"
 
 // Validate returns why the pod cannot run on briglet, or "" when it can.
+// Init containers, sidecars and several containers run under the guest
+// supervisor; host namespaces and ephemeral containers do not exist there.
 func Validate(pod *corev1.Pod) string {
 	s := &pod.Spec
 	var why []string
@@ -47,22 +49,8 @@ func Validate(pod *corev1.Pod) string {
 	if s.HostIPC {
 		why = append(why, "hostIPC")
 	}
-	if len(s.InitContainers) > 0 {
-		why = append(why, "init containers")
-	}
-	if len(s.Containers) != 1 {
-		why = append(why, fmt.Sprintf("%d containers (one is supported)", len(s.Containers)))
-	}
 	if len(s.EphemeralContainers) > 0 {
 		why = append(why, "ephemeral containers")
-	}
-	if sc := s.SecurityContext; sc != nil && sc.RunAsUser != nil {
-		why = append(why, "securityContext.runAsUser")
-	}
-	for _, c := range s.Containers {
-		if sc := c.SecurityContext; sc != nil && sc.RunAsUser != nil {
-			why = append(why, "container securityContext.runAsUser")
-		}
 	}
 	why = append(why, unsupportedVolumes(pod)...)
 	if len(why) == 0 {
@@ -74,14 +62,20 @@ func Validate(pod *corev1.Pod) string {
 // Ignored lists container settings briglet accepts but does not apply.
 func Ignored(c *corev1.Container) []string {
 	var out []string
-	if c.WorkingDir != "" {
-		out = append(out, fmt.Sprintf("workingDir %q is ignored: hull starts the container in /", c.WorkingDir))
+	if sc := c.SecurityContext; sc != nil && sc.Capabilities != nil && len(sc.Capabilities.Add)+len(sc.Capabilities.Drop) > 0 {
+		out = append(out, fmt.Sprintf("capabilities of container %s are ignored: root keeps every capability and other users get none", c.Name))
 	}
-	for _, p := range []*corev1.Probe{c.StartupProbe, c.LivenessProbe, c.ReadinessProbe} {
-		if p != nil && p.GRPC != nil {
-			out = append(out, fmt.Sprintf("gRPC probe on port %d is checked as a TCP connect: briglet does not speak the gRPC health protocol", p.GRPC.Port))
-			break
-		}
+	return out
+}
+
+// AllContainers lists the init containers, then the regular ones.
+func AllContainers(pod *corev1.Pod) []*corev1.Container {
+	var out []*corev1.Container
+	for i := range pod.Spec.InitContainers {
+		out = append(out, &pod.Spec.InitContainers[i])
+	}
+	for i := range pod.Spec.Containers {
+		out = append(out, &pod.Spec.Containers[i])
 	}
 	return out
 }

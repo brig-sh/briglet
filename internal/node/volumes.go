@@ -18,7 +18,6 @@ import (
 	"context"
 	"fmt"
 	"path"
-	"path/filepath"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -33,13 +32,13 @@ import (
 const serviceAccountVolume = "kube-api-access-briglet"
 
 func (w *podWorker) podDirs() podvm.PodDirs {
-	d := podDir(w.m.podsDir, string(w.uid))
-	return podvm.PodDirs{Volumes: filepath.Join(d, "volumes"), Subpath: filepath.Join(d, "subpath")}
+	return podvm.NewPodDirs(podDir(w.m.podsDir, string(w.uid)))
 }
 
-// facts are the downward API values of the pod as the agent runs it.
+// facts are the downward API values of the pod as the agent runs it. A
+// limit a container does not set resolves to the VM's size.
 func (w *podWorker) facts(pod *corev1.Pod) podvm.PodFacts {
-	cpus, mem := podvm.Resources(&pod.Spec.Containers[0])
+	cpus, mem := podvm.PodResources(pod)
 	return podvm.PodFacts{PodIP: w.snapshot().IP, HostIP: w.m.hostIP, NodeName: w.m.node, CPUs: cpus, MemMB: mem}
 }
 
@@ -73,18 +72,28 @@ func (w *podWorker) effectivePod(ctx context.Context, pod *corev1.Pod) *corev1.P
 			},
 		}},
 	})
-	c := &p.Spec.Containers[0]
-	c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{
-		Name: serviceAccountVolume, MountPath: podvm.ServiceAccountMountPath, ReadOnly: true,
-	})
+	for _, c := range podvm.AllContainers(p) {
+		if !mountsServiceAccount(c) {
+			c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{
+				Name: serviceAccountVolume, MountPath: podvm.ServiceAccountMountPath, ReadOnly: true,
+			})
+		}
+	}
 	return p
 }
 
-func (w *podWorker) wantsServiceAccountVolume(ctx context.Context, pod *corev1.Pod) bool {
-	for _, m := range pod.Spec.Containers[0].VolumeMounts {
+func mountsServiceAccount(c *corev1.Container) bool {
+	for _, m := range c.VolumeMounts {
 		if path.Clean(m.MountPath) == podvm.ServiceAccountMountPath {
-			return false
+			return true
 		}
+	}
+	return false
+}
+
+func (w *podWorker) wantsServiceAccountVolume(ctx context.Context, pod *corev1.Pod) bool {
+	if mountsServiceAccount(&pod.Spec.Containers[0]) {
+		return false
 	}
 	if a := pod.Spec.AutomountServiceAccountToken; a != nil {
 		return *a

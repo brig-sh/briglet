@@ -197,8 +197,13 @@ echo "dflt (dnsPolicy Default, as CoreDNS) keeps the gateway resolver:"
 rc=$(kx dflt -- cat /etc/resolv.conf)
 echo "$rc"
 [ "$rc" = "nameserver 10.87.0.1" ] || fail "dflt resolv.conf"
-echo "CoreDNS has no shell, so the agent leaves its guest as hull set it up:"
-grep -h "coredns.*set hostname" "$STATE/logs/node.log" | tail -1 | cut -c28-
+echo "CoreDNS has no shell to exec; the supervisor bound these files from its pod directory:"
+dns_pod=$(k -n kube-system get pod -l k8s-app=kube-dns -o jsonpath='{.items[0].metadata.name}')
+dns_uid=$(k -n kube-system get pod "$dns_pod" -o jsonpath='{.metadata.uid}')
+for f in hostname resolv.conf; do
+	printf '%s: %s\n' "$f" "$(tr '\n' ' ' <"$STATE/pods/$dns_uid/guest/etc/$f")"
+done
+[ "$(cat "$STATE/pods/$dns_uid/guest/etc/hostname")" = "$dns_pod" ] || fail "CoreDNS hostname file"
 
 step "nslookup web (dns pod, busybox:1.28)"
 out=$(kx dns -- nslookup web)
@@ -230,9 +235,7 @@ web_pods | sort | diff - "$TMP/hit-names" || fail "the answering pods are not th
 
 step "the replicas see the gateway as the client address"
 for p in $(web_pods); do
-	# nginx opened /dev/stdout before the agent linked it, so its access
-	# log is a regular file there.
-	line=$(kx "$p" -- grep 'GET /host.txt' /dev/stdout | tail -1)
+	line=$(k logs "$p" | grep 'GET /host.txt' | tail -1)
 	echo "$p: $line"
 	case "$line" in "10.87.0.1 "*Wget*) ;; *) fail "$p: unexpected access log line" ;; esac
 done

@@ -46,3 +46,29 @@ func TestRunArgsSharesAndSecretEnv(t *testing.T) {
 		t.Errorf("flags must precede -- and the image: %s", line)
 	}
 }
+
+func TestNormalizeRef(t *testing.T) {
+	cases := map[string]string{
+		"busybox":                        "docker.io/library/busybox:latest",
+		"busybox:1.28":                   "docker.io/library/busybox:1.28",
+		"user/app":                       "docker.io/user/app:latest",
+		"registry.k8s.io/pause:3.10":     "registry.k8s.io/pause:3.10",
+		"localhost:5000/app":             "localhost:5000/app:latest",
+		"nginx@sha256:abc":               "docker.io/library/nginx@sha256:abc",
+		"docker.io/library/nginx:alpine": "docker.io/library/nginx:alpine",
+	}
+	for in, want := range cases {
+		if got := NormalizeRef(in); got != want {
+			t.Errorf("NormalizeRef(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if got := MirrorRef("busybox", "mirror.gcr.io"); got != "mirror.gcr.io/library/busybox:latest" {
+		t.Errorf("MirrorRef(busybox) = %q", got)
+	}
+	if got := MirrorRef("registry.k8s.io/pause:3.10", "mirror.gcr.io"); got != "registry.k8s.io/pause:3.10" {
+		t.Errorf("MirrorRef(registry.k8s.io) = %q", got)
+	}
+	if got := MirrorRef("busybox", ""); got != "busybox" {
+		t.Errorf("MirrorRef without a mirror = %q", got)
+	}
+}

@@ -15,16 +15,14 @@
 package node
 
 import (
-	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -42,25 +40,25 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 
+	"github.com/brig-sh/briglet/internal/guest"
 	"github.com/brig-sh/briglet/internal/hull"
 	"github.com/brig-sh/briglet/internal/podvm"
 )
 
 const (
+	// pollInterval is how often the agent checks that the VM still runs;
+	// guestPoll is how often it reads status.json.
 	pollInterval   = 5 * time.Second
+	guestPoll      = 250 * time.Millisecond
 	backoffInitial = 10 * time.Second
 	backoffMax     = 5 * time.Minute
-	// A container that ran this long without exiting resets the back-off,
-	// as the kubelet does.
+	// A VM that ran this long without ending resets the back-off.
 	backoffReset = 10 * time.Minute
 	runTimeout   = 5 * time.Minute
-	// hostnameWait bounds the retries of the post-boot hostname exec. The
-	// agent socket accepts before the guest agent listens.
-	hostnameWait = 20 * time.Second
-	// exitCodeClean and exitCodeKilled are what briglet reports for a VM
-	// that ended. hull does not observe the guest's exit status: a VM whose
-	// guest shut itself down reports 0, one that died otherwise reports 137.
-	exitCodeClean  = 0
+	// supervisorWait bounds the time from boot to the first status.json.
+	supervisorWait = 60 * time.Second
+	// exitCodeKilled is what a container that was running reports when its
+	// VM went away underneath it.
 	exitCodeKilled = 137
 )
 
@@ -86,8 +84,17 @@ type podManager struct {
 	// informer.
 	apiServiceIP string
 	// dns is what pod resolv.conf files are built from.
-	dns         podvm.DNS
-	gw          *hull.Gateway
+	dns podvm.DNS
+	gw  *hull.Gateway
+	// guestBinDir holds briglet-guest; every VM shares it read-only.
+	guestBinDir string
+	// baseImage is the image every pod VM boots.
+	baseImage string
+	// registryMirror, when set, serves every Docker Hub image.
+	registryMirror string
+	// imageLinks holds a colon-free symlink to each image rootfs, since
+	// hull's share syntax splits on colons and digests carry one.
+	imageLinks  string
 	sources     *sourceWatch
 	src         *apiSources
 	probeClient *http.Client
@@ -116,23 +123,27 @@ func newPodManager(cs kubernetes.Interface, cfg Config, h *hull.Client, shared i
 		apiIP = "10.96.0.1"
 	}
 	return &podManager{
-		apiServiceIP: apiIP,
-		shared:       shared,
-		dns:          podvm.DNS{ClusterDNS: cfg.ClusterDNS, Domain: cfg.ClusterDomain, Upstream: cfg.HostIP},
-		gw:           hull.NewGateway(cfg.GatewaySock + ".api"),
-		sources:      sw,
-		src:          &apiSources{cs: cs, watch: sw},
-		probeClient:  newProbeClient(),
-		cs:           cs,
-		node:         cfg.Name,
-		hostIP:       cfg.HostIP,
-		hull:         h,
-		ipam:         ipam,
-		podsDir:      cfg.PodsDir,
-		gwSock:       cfg.GatewaySock,
-		maxName:      maxName,
-		recorder:     b.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "kubelet", Host: cfg.Name}),
-		workers:      map[types.UID]*podWorker{},
+		apiServiceIP:   apiIP,
+		shared:         shared,
+		dns:            podvm.DNS{ClusterDNS: cfg.ClusterDNS, Domain: cfg.ClusterDomain, Upstream: cfg.HostIP},
+		gw:             hull.NewGateway(cfg.GatewaySock + ".api"),
+		guestBinDir:    cfg.GuestBinDir,
+		baseImage:      cfg.BaseImage,
+		registryMirror: cfg.RegistryMirror,
+		imageLinks:     filepath.Join(cfg.StateDir, "image-links"),
+		sources:        sw,
+		src:            &apiSources{cs: cs, watch: sw},
+		probeClient:    newProbeClient(),
+		cs:             cs,
+		node:           cfg.Name,
+		hostIP:         cfg.HostIP,
+		hull:           h,
+		ipam:           ipam,
+		podsDir:        cfg.PodsDir,
+		gwSock:         cfg.GatewaySock,
+		maxName:        maxName,
+		recorder:       b.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "kubelet", Host: cfg.Name}),
+		workers:        map[types.UID]*podWorker{},
 	}, nil
 }
 
@@ -241,6 +252,68 @@ func (m *podManager) serviceEnv(pod *corev1.Pod) []podvm.EnvVar {
 	return podvm.ServiceEnv(pod, svcs)
 }
 
+// reasonNodePorts is the status reason of a pod refused for its hostPort.
+const reasonNodePorts = "NodePorts"
+
+// hostPortConflict reports why pod cannot take its hostPorts: another pod
+// of this node that holds a VM already uses one of them. It returns "" when
+// there is no conflict.
+func (m *podManager) hostPortConflict(self *podWorker, pod *corev1.Pod) string {
+	if len(hostPortsOf(pod)) == 0 {
+		return ""
+	}
+	m.mu.Lock()
+	var others []*podWorker
+	for _, w := range m.workers {
+		if w != self {
+			others = append(others, w)
+		}
+	}
+	m.mu.Unlock()
+	for _, o := range others {
+		st := o.snapshot()
+		if !st.Running || st.Done {
+			continue
+		}
+		if op, _ := o.current(); op != nil && hostPortsConflict(pod, op) {
+			return "Pod was rejected: node(s) didn't have free ports for the requested pod ports"
+		}
+	}
+	return ""
+}
+
+// hostPortsOf lists the pod's container ports that name a host port.
+func hostPortsOf(pod *corev1.Pod) []corev1.ContainerPort {
+	var out []corev1.ContainerPort
+	for _, c := range podvm.AllContainers(pod) {
+		for _, p := range c.Ports {
+			if p.HostPort > 0 {
+				if p.Protocol == "" {
+					p.Protocol = corev1.ProtocolTCP
+				}
+				out = append(out, p)
+			}
+		}
+	}
+	return out
+}
+
+// hostPortsConflict reports whether a and b ask for the same host port with
+// the same protocol on overlapping host addresses; an empty or unspecified
+// hostIP covers every address.
+func hostPortsConflict(a, b *corev1.Pod) bool {
+	wild := func(ip string) bool { return ip == "" || ip == "0.0.0.0" || ip == "::" }
+	for _, pa := range hostPortsOf(a) {
+		for _, pb := range hostPortsOf(b) {
+			if pa.HostPort == pb.HostPort && pa.Protocol == pb.Protocol &&
+				(wild(pa.HostIP) || wild(pb.HostIP) || pa.HostIP == pb.HostIP) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (m *podManager) onPod(obj any) {
 	pod, ok := obj.(*corev1.Pod)
 	if !ok {
@@ -325,6 +398,7 @@ type podWorker struct {
 	gone         bool
 	st           podState
 	volumesDirty bool
+	obsGen       atomic.Int64 // generation the last status write observed
 }
 
 func newPodWorker(m *podManager, pod *corev1.Pod) *podWorker {
@@ -349,6 +423,19 @@ func (w *podWorker) current() (*corev1.Pod, bool) {
 }
 
 // stopping reports whether the pod is being deleted or is gone.
+// deadlinePassed reports whether the pod's activeDeadlineSeconds elapsed
+// while it still runs.
+func (w *podWorker) deadlinePassed() bool {
+	pod, _ := w.current()
+	if pod == nil || pod.Spec.ActiveDeadlineSeconds == nil || pod.CreationTimestamp.IsZero() {
+		return false
+	}
+	if w.snapshot().Done || !w.snapshot().Running {
+		return false
+	}
+	return time.Since(pod.CreationTimestamp.Time) > time.Duration(*pod.Spec.ActiveDeadlineSeconds)*time.Second
+}
+
 func (w *podWorker) stopping() bool {
 	pod, gone := w.current()
 	return gone || pod.DeletionTimestamp != nil
@@ -396,7 +483,17 @@ func (w *podWorker) sleep(ctx context.Context, d time.Duration) bool {
 			if w.stopping() {
 				return true
 			}
+			w.syncGeneration(ctx)
 		}
+	}
+}
+
+// syncGeneration writes the status when the pod's spec changed since the
+// last write, so status.observedGeneration follows metadata.generation even
+// while the pod is idle, finished or waiting to start.
+func (w *podWorker) syncGeneration(ctx context.Context) {
+	if pod, gone := w.current(); !gone && pod.Generation != w.obsGen.Load() {
+		w.syncStatus(ctx)
 	}
 }
 
@@ -410,6 +507,9 @@ func (w *podWorker) nap(ctx context.Context, d time.Duration) bool {
 		return true
 	case <-t.C:
 	case <-w.wake:
+		if !w.stopping() {
+			w.syncGeneration(ctx)
+		}
 	}
 	return w.stopping()
 }
@@ -417,17 +517,27 @@ func (w *podWorker) nap(ctx context.Context, d time.Duration) bool {
 func (w *podWorker) loop(ctx context.Context) {
 	defer w.m.forget(w)
 	pod, _ := w.current()
-	c := &pod.Spec.Containers[0]
 	w.init(ctx, pod)
 
 	if w.st.Rejected == "" {
 		if why := podvm.Validate(pod); why != "" {
-			w.set(func(st *podState) { st.Rejected = why; st.Done = true })
+			w.set(func(st *podState) { st.Rejected = why; st.Done = true; st.Phase = string(corev1.PodFailed) })
 			w.event(corev1.EventTypeWarning, podvm.ReasonUnsupported, "%s", why)
 			w.logf("rejected: %s", why)
+		} else if why := w.m.hostPortConflict(w, pod); why != "" && !w.st.Created {
+			// The node's port space is a Mac's: like the kubelet's predicate
+			// admission, refuse a pod whose hostPort a running pod holds.
+			w.set(func(st *podState) {
+				st.Rejected, st.RejectedReason = why, reasonNodePorts
+				st.Done, st.Phase = true, string(corev1.PodFailed)
+			})
+			w.event(corev1.EventTypeWarning, reasonNodePorts, "%s", why)
+			w.logf("rejected: %s", why)
 		} else if !w.st.Created {
-			for _, msg := range podvm.Ignored(c) {
-				w.event(corev1.EventTypeWarning, podvm.ReasonUnsupported, "%s", msg)
+			for _, c := range podvm.AllContainers(pod) {
+				for _, msg := range podvm.Ignored(c) {
+					w.event(corev1.EventTypeWarning, podvm.ReasonUnsupported, "%s", msg)
+				}
 			}
 		}
 	}
@@ -441,6 +551,22 @@ func (w *podWorker) loop(ctx context.Context) {
 		if w.stopping() {
 			w.teardown(ctx)
 			return
+		}
+		if w.deadlinePassed() {
+			w.set(func(st *podState) {
+				st.Deadline = true
+				st.Done = true
+				st.Phase = string(corev1.PodFailed)
+				st.Reason = "DeadlineExceeded"
+			})
+			w.event(corev1.EventTypeNormal, "DeadlineExceeded", "Pod was active longer than specified deadline")
+			w.logf("activeDeadlineSeconds elapsed")
+			// Stop the containers but keep the pod object, as the kubelet
+			// does: the statuses carry the DeadlineExceeded reason.
+			w.stopRunning(ctx)
+			w.syncStatus(ctx)
+			w.sleep(ctx, time.Hour)
+			continue
 		}
 		if w.snapshot().Done {
 			w.sleep(ctx, time.Hour)
@@ -459,53 +585,33 @@ func (w *podWorker) loop(ctx context.Context) {
 			}
 			w.syncStatus(ctx)
 		}
-
-		code, ok := w.watch(ctx)
-		if !ok {
+		how := w.watch(ctx)
+		if how == vmRunning {
 			continue // stopping, or the agent is shutting down
 		}
-		st := w.snapshot()
-		now := time.Now()
-		term := &termState{ExitCode: code, StartedAt: st.StartedAt, FinishedAt: now, Reason: "Completed"}
-		if code != 0 {
-			term.Reason = "Error"
+		if time.Since(w.snapshot().StartedAt) > backoffReset {
+			backoff = backoffInitial
 		}
-		w.logf("VM %s ended; reporting exit code %d", st.Instance, code)
-		pod, _ = w.current()
-		restart := pod.Spec.RestartPolicy == corev1.RestartPolicyAlways ||
-			(pod.Spec.RestartPolicy == corev1.RestartPolicyOnFailure && code != 0)
-		if !restart {
-			w.set(func(st *podState) { st.Running = false; st.Done = true; st.Term = term })
+		if w.vmEnded(ctx, how) {
 			w.syncStatus(ctx)
 			continue
 		}
-		if now.Sub(st.StartedAt) > backoffReset {
-			backoff = backoffInitial
-		}
-		w.set(func(st *podState) {
-			st.Running = false
-			st.Term = term
-			st.Waiting = &waitingState{Reason: "CrashLoopBackOff",
-				Message: fmt.Sprintf("back-off %s restarting failed container=%s pod=%s_%s(%s)", backoff, c.Name, w.name, w.ns, w.uid)}
-		})
-		w.event(corev1.EventTypeWarning, "BackOff", "Back-off restarting failed container %s in pod %s_%s(%s)", c.Name, w.name, w.ns, w.uid)
 		w.syncStatus(ctx)
 		if w.sleep(ctx, backoff) {
 			continue
 		}
 		backoff = min(backoff*2, backoffMax)
-		w.set(func(st *podState) { st.RestartCount++; st.LastTerm = term; st.Term = nil })
 	}
 }
 
-// adopt picks up a container that runs from before an agent restart: the
-// volume subscriptions and the gateway forwards. The volumes are rewritten
-// on the first turn of watch.
+// adopt picks up a VM that runs from before an agent restart: the volume
+// subscriptions and the gateway forwards. The volumes are rewritten on the
+// first turn of watch.
 func (w *podWorker) adopt(ctx context.Context) {
 	pod, _ := w.current()
 	pod = w.effectivePod(ctx, pod)
 	w.m.sources.Set(w.uid, volumeKeys(pod), w.volumesChanged)
-	w.ensureForwards(ctx, &pod.Spec.Containers[0])
+	w.ensureForwards(ctx, pod)
 }
 
 // init loads the persisted state or starts a fresh one, and decides what a
@@ -517,9 +623,7 @@ func (w *podWorker) init(ctx context.Context, pod *corev1.Pod) {
 	}
 	st := podState{
 		UID: string(pod.UID), Namespace: pod.Namespace, Name: pod.Name,
-		Container: pod.Spec.Containers[0].Name,
-		Instance:  podvm.InstanceName(pod, w.m.maxName),
-		Image:     pod.Spec.Containers[0].Image,
+		Instance: podvm.InstanceName(pod, w.m.maxName),
 	}
 	switch {
 	case prev != nil:
@@ -529,359 +633,76 @@ func (w *podWorker) init(ctx context.Context, pod *corev1.Pod) {
 			if err == nil && in.Alive() {
 				w.logf("adopted running VM %s (pid %d)", st.Instance, in.PID)
 			} else {
-				// watch reports the exit on its first poll.
-				w.logf("VM %s of a running container is gone", st.Instance)
+				// watch reports the end on its first poll.
+				w.logf("VM %s of a running pod is gone", st.Instance)
 			}
 		}
 	case pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed:
 		// Finished before this agent kept state for it: never run it again.
 		st.Done = true
+		st.Phase = string(pod.Status.Phase)
 	}
 	w.mu.Lock()
 	w.st = st
 	w.mu.Unlock()
 }
 
-// start boots the pod's VM: address, image, volumes, env and argv, hull
-// run, then the hostname and the gateway forwards.
-func (w *podWorker) start(ctx context.Context) error {
-	pod, _ := w.current()
-	pod = w.effectivePod(ctx, pod)
-	c := &pod.Spec.Containers[0]
-	h := w.m.hull
+// teardown stops the pod: the supervisor gets the grace period to stop the
+// containers and power the VM off, then the VM is removed. The address and
+// pod dir are freed and, when the pod object still exists, it is deleted
+// with grace 0 as the kubelet does.
+// stopRunning stops the VM and releases its resources without deleting
+// the pod object: the deadline path, whose statuses the agent keeps
+// reporting.
+func (w *podWorker) stopRunning(ctx context.Context) {
 	st := w.snapshot()
-
-	waiting := func(reason, msg string) {
-		w.set(func(st *podState) { st.Waiting = &waitingState{Reason: reason, Message: msg} })
-	}
-	configErr := func(err error) error {
-		waiting("CreateContainerConfigError", err.Error())
-		w.event(corev1.EventTypeWarning, "Failed", "Error: %v", err)
-		return err
-	}
-	ip, err := w.m.ipam.Allocate(string(pod.UID), pod.Namespace+"/"+pod.Name)
-	if err != nil {
-		waiting("CreateContainerError", err.Error())
-		return err
-	}
-	w.set(func(st *podState) { st.IP = ip })
-
-	// Volumes come first, as in the kubelet: a pod whose ConfigMap is
-	// missing stays ContainerCreating with FailedMount events.
-	if err := w.writeVolumes(ctx, pod); err != nil {
-		waiting("ContainerCreating", err.Error())
-		w.event(corev1.EventTypeWarning, "FailedMount", "%v", err)
-		return err
-	}
-	w.lastMeta = metaKey(pod)
-
-	img, err := w.ensureImage(ctx, c)
-	if err != nil {
-		return err
-	}
-	cfg, err := h.Config(img.Digest)
-	if err != nil {
-		waiting("CreateContainerConfigError", err.Error())
-		return err
-	}
-	env, err := podvm.Env(ctx, podvm.EnvInput{
-		Pod: pod, Container: c, Image: cfg, Facts: w.facts(pod),
-		Services: w.m.serviceEnv(pod), Src: w.m.src,
-	})
-	if err != nil {
-		return configErr(err)
-	}
-	pairs := podvm.Pairs(env)
-	argv, err := podvm.Argv(c, cfg, pairs)
-	if err != nil {
-		return configErr(err)
-	}
-	plain, secret, err := podvm.HullEnv(env)
-	if err != nil {
-		return configErr(err)
-	}
-	cpus, mem := podvm.Resources(c)
-
-	// No restart in hull: a previous VM under the name is removed first.
-	if err := h.Rm(ctx, st.Instance, true); err != nil && !errors.Is(err, hull.ErrNotFound) {
-		w.logf("rm stale %s: %v", st.Instance, err)
-	}
-	shares, err := podvm.Shares(pod, c, w.podDirs(), env)
-	if err != nil {
-		return configErr(err)
-	}
-	spec := hull.RunSpec{
-		Name:        st.Instance,
-		Image:       c.Image,
-		Pull:        "missing", // ensureImage applied imagePullPolicy already
-		MemMB:       mem,
-		CPUs:        cpus,
-		GatewaySock: w.m.gwSock,
-		GatewayCIDR: fmt.Sprintf("%s/%d", ip, w.m.ipam.Bits()),
-		StopGrace:   podvm.GraceSeconds(pod),
-		Env:         plain,
-		SecretEnv:   secret,
-		Shares:      shares,
-		Argv:        argv,
-	}
-	var shareArgs []string
-	for _, sh := range shares {
-		shareArgs = append(shareArgs, sh.Arg())
-	}
-	w.logf("hull run %s: %d vCPU, %d MB, %s, %d env (%d from Secrets), shares %q, argv %q",
-		st.Instance, cpus, mem, spec.GatewayCIDR, len(env), len(secret), shareArgs, argv)
-	t0 := time.Now()
-	rctx, cancel := context.WithTimeout(ctx, runTimeout)
-	_, err = h.Run(rctx, spec)
-	cancel()
-	if err != nil {
-		waiting("RunContainerError", err.Error())
-		w.event(corev1.EventTypeWarning, "Failed", "Error: %v", err)
-		_ = h.Rm(ctx, st.Instance, true)
-		return err
-	}
-	started := time.Now()
-	w.set(func(st *podState) { st.Created = true; st.Env = pairs; st.ImageID = imageID(c.Image, img) })
-	w.event(corev1.EventTypeNormal, "Created", "Created container: %s", c.Name)
-	w.logf("VM %s up in %.1fs", st.Instance, time.Since(t0).Seconds())
-	w.setHostname(ctx, pod, ip)
-	w.ensureForwards(ctx, c)
-	w.set(func(st *podState) {
-		st.Running = true
-		st.StartedAt = started
-		st.Waiting = nil
-		st.Term = nil
-		initialProbeState(c, st)
-	})
-	w.event(corev1.EventTypeNormal, "Started", "Started container %s", c.Name)
-	return nil
-}
-
-// metaKey fingerprints what a downwardAPI volume can read from the pod
-// metadata that changes while the pod runs. fmt prints maps sorted.
-func metaKey(pod *corev1.Pod) string {
-	return fmt.Sprint(pod.Labels, pod.Annotations)
-}
-
-// ensureImage applies imagePullPolicy and returns the image record.
-func (w *podWorker) ensureImage(ctx context.Context, c *corev1.Container) (*hull.Image, error) {
-	h := w.m.hull
-	w.m.pullMu.Lock()
-	defer w.m.pullMu.Unlock()
-	img, local := h.LocalImage(c.Image)
-	policy := podvm.PullPolicy(c)
-	switch {
-	case policy == "never" && !local:
-		msg := fmt.Sprintf("Container image %q is not present with pull policy of Never", c.Image)
-		w.set(func(st *podState) { st.Waiting = &waitingState{Reason: "ErrImageNeverPull", Message: msg} })
-		w.event(corev1.EventTypeWarning, "ErrImageNeverPull", "%s", msg)
-		return nil, errors.New(msg)
-	case local && policy != "always":
-		w.event(corev1.EventTypeNormal, "Pulled", "Container image %q already present on machine", c.Image)
-		return img, nil
-	}
-	w.event(corev1.EventTypeNormal, "Pulling", "Pulling image %q", c.Image)
-	t0 := time.Now()
-	digest, err := h.Pull(ctx, c.Image)
-	if err == nil {
-		img, err = h.ImageByDigest(digest)
-	}
-	if err != nil {
-		w.set(func(st *podState) { st.Waiting = &waitingState{Reason: "ErrImagePull", Message: err.Error()} })
-		w.event(corev1.EventTypeWarning, "Failed", "Failed to pull image %q: %v", c.Image, err)
-		return nil, err
-	}
-	w.event(corev1.EventTypeNormal, "Pulled", "Successfully pulled image %q in %s", c.Image, time.Since(t0).Round(time.Millisecond))
-	return img, nil
-}
-
-// imageID renders the image identity like the kubelet does:
-// <repository>@<digest>.
-func imageID(ref string, img *hull.Image) string {
-	repo := ref
-	if i := strings.IndexByte(repo, '@'); i >= 0 {
-		repo = repo[:i]
-	} else if i := strings.LastIndexByte(repo, ':'); i >= 0 && !strings.Contains(repo[i+1:], "/") {
-		repo = repo[:i]
-	}
-	first, _, found := strings.Cut(repo, "/")
-	if !found || (!strings.ContainsAny(first, ".:") && first != "localhost") {
-		if !found {
-			repo = "library/" + repo
-		}
-		repo = "docker.io/" + repo
-	}
-	return repo + "@" + img.ID()
-}
-
-// setHostname gives the guest the pod's hostname, which Kubernetes expects
-// to equal the pod name, an /etc/hosts entry for it, and the resolv.conf of
-// its dnsPolicy. It needs a shell in the image; without one the guest keeps
-// hull's defaults.
-func (w *podWorker) setHostname(ctx context.Context, pod *corev1.Pod, ip string) {
-	name := pod.Name
-	if pod.Spec.Hostname != "" {
-		name = pod.Spec.Hostname
-	}
-	if len(name) > 63 {
-		name = name[:63]
-	}
-	// hull's guest /dev has no stdin, stdout, stderr or fd links. A process
-	// that opens /dev/stdout before this runs creates a regular file there;
-	// one that starts later gets the console. The resolv.conf rewrite has
-	// the same race: a lookup in the container's first moments still goes
-	// to the gateway resolver hull configured.
-	script := `hostname "$1" && echo "$1" > /etc/hostname && printf '%s\t%s\n' "$2" "$1" >> /etc/hosts
-rc=$?
-if [ -n "$3" ]; then printf '%s' "$3" > /etc/resolv.conf || rc=1; fi
-for n in 0:stdin 1:stdout 2:stderr; do [ -e "/dev/${n#*:}" ] || ln -s "/proc/self/fd/${n%%:*}" "/dev/${n#*:}"; done
-[ -e /dev/fd ] || ln -s /proc/self/fd /dev/fd
-exit $rc`
-	argv := []string{"/bin/sh", "-c", script, "sh", name, ip, podvm.ResolvConf(pod, w.m.dns)}
-	deadline := time.Now().Add(hostnameWait)
-	for {
-		var out bytes.Buffer
-		ectx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		code, err := w.m.hull.Exec(ectx, w.snapshot().Instance, nil, argv, nil, &out, &out)
+	bg := context.WithoutCancel(ctx)
+	if st.Running && w.vmAlive(bg) {
+		cctx, cancel := context.WithTimeout(bg, 10*time.Second)
+		err := w.ctl(cctx, guest.CtlRequest{Op: guest.CtlStop, Grace: 2})
 		cancel()
-		switch {
-		case err == nil && code == 0:
-			return
-		case err == nil:
-			w.logf("set hostname: exit %d: %s (does the image have /bin/sh?)", code, strings.TrimSpace(out.String()))
-			return
-		case strings.Contains(err.Error(), "fork/exec /bin/sh"):
-			// The agent answered: the image has no shell (distroless,
-			// CoreDNS). Retrying cannot help.
-			w.logf("set hostname: the image has no /bin/sh; the guest keeps hull's hostname and resolv.conf")
-			return
-		case time.Now().After(deadline) || ctx.Err() != nil:
-			w.logf("set hostname: %v", err)
-			return
+		if err != nil {
+			w.logf("stop through the supervisor: %v", err)
+		} else if !w.waitVMEnd(bg, 10*time.Second) {
+			w.logf("VM %s still runs after the stop; stopping it", st.Instance)
 		}
-		if in, ierr := w.m.hull.Inspect(ctx, w.snapshot().Instance); ierr != nil || !in.Alive() {
-			w.logf("set hostname: the VM ended before its agent answered")
-			return
-		}
-		time.Sleep(500 * time.Millisecond)
 	}
+	sctx, cancel := context.WithTimeout(bg, 60*time.Second)
+	if err := w.m.hull.StopAndRemove(sctx, st.Instance, 2); err != nil {
+		w.logf("stop %s: %v", st.Instance, err)
+	}
+	cancel()
+	// Keep the supervisor's final status, so the containers end with their
+	// real terminations instead of ContainerStatusUnknown.
+	pod, _ := w.current()
+	w.readGuest(bg, pod)
+	w.set(func(n *podState) { n.Running = false })
+	removeForwards(bg, w.m.gw, &st)
 }
 
-// watch polls the VMM every pollInterval until it exits, runs the probes
-// when they are due, and keeps the volumes current. It returns the exit code
-// briglet reports for the container: the VM's, or 137 when a startup or
-// liveness probe failed and the agent stopped the VM. ok is false when the
-// pod started stopping or ctx ended.
-func (w *podWorker) watch(ctx context.Context) (code int32, ok bool) {
-	nextInspect := time.Now()
-	for {
-		if w.stopping() || ctx.Err() != nil {
-			return 0, false
+// finishStatus writes the terminal status of a pod that is being deleted,
+// before its object is removed, as the kubelet does: Succeeded when every
+// container exited 0, Failed otherwise. A pod object that keeps a finalizer,
+// such as a Job's pod, would stay in Terminating with phase Running, because
+// the controller removes the finalizer only from a pod that finished.
+func (w *podWorker) finishStatus(ctx context.Context) {
+	pod, _ := w.current()
+	w.readGuest(ctx, pod)
+	w.set(func(st *podState) {
+		st.Running = false
+		if st.Done {
+			return
 		}
-		pod, _ := w.current()
-		pod = w.effectivePod(ctx, pod)
-		if now := time.Now(); !now.Before(nextInspect) {
-			id := w.snapshot().Instance
-			in, err := w.m.hull.Inspect(ctx, id)
-			switch {
-			case errors.Is(err, hull.ErrNotFound):
-				return exitCodeKilled, true
-			case err != nil:
-				w.logf("inspect %s: %v", id, err)
-			case !in.Alive():
-				return w.exitCode(ctx, id), true
+		st.Done, st.Phase = true, string(corev1.PodSucceeded)
+		for _, c := range pod.Spec.Containers {
+			if cs := st.Guest.Find(c.Name); cs == nil || cs.Term == nil || cs.Term.ExitCode != 0 {
+				st.Phase = string(corev1.PodFailed)
 			}
-			nextInspect = now.Add(pollInterval)
-			w.gcVolumes(pod)
 		}
-		w.maybeRefreshVolumes(ctx, pod)
-		kill, changed, next := w.probe(ctx, pod, time.Now())
-		if changed {
-			w.syncStatus(ctx)
-		}
-		if kill != "" {
-			w.kill(ctx, pod, kill)
-			return exitCodeKilled, true
-		}
-		wait := time.Until(nextInspect)
-		if !next.IsZero() {
-			wait = min(wait, time.Until(next))
-		}
-		if tr := w.snapshot().TokenRefreshAt; !tr.IsZero() {
-			wait = min(wait, time.Until(tr))
-		}
-		if w.nap(ctx, max(wait, 100*time.Millisecond)) {
-			return 0, false
-		}
-	}
+	})
+	w.syncStatus(ctx)
 }
 
-// kill stops the VM of a container whose startup or liveness probe failed,
-// with the probe's terminationGracePeriodSeconds or the pod's.
-func (w *podWorker) kill(ctx context.Context, pod *corev1.Pod, kind string) {
-	c := &pod.Spec.Containers[0]
-	grace := podvm.GraceSeconds(pod)
-	for _, ps := range probesOf(c) {
-		if ps.kind == kind && ps.p.TerminationGracePeriodSeconds != nil {
-			grace = int(*ps.p.TerminationGracePeriodSeconds)
-		}
-	}
-	id := w.snapshot().Instance
-	t0 := time.Now()
-	sctx, cancel := context.WithTimeout(ctx, time.Duration(grace+60)*time.Second)
-	defer cancel()
-	if err := w.m.hull.Stop(sctx, id, grace); err != nil {
-		w.logf("stop %s after the %s probe failed: %v", id, kind, err)
-	}
-	w.logf("VM %s stopped in %.1fs after the %s probe failed", id, time.Since(t0).Seconds(), kind)
-}
-
-// maybeRefreshVolumes rewrites the volumes when a ConfigMap or Secret they
-// read changed, the pod metadata changed, or a token is due.
-func (w *podWorker) maybeRefreshVolumes(ctx context.Context, pod *corev1.Pod) {
-	meta := metaKey(pod)
-	tr := w.snapshot().TokenRefreshAt
-	dirty := w.takeVolumesDirty()
-	if !dirty && meta == w.lastMeta && (tr.IsZero() || time.Now().Before(tr)) {
-		return
-	}
-	w.lastMeta = meta
-	changed, err := w.refreshVolumes(ctx, pod)
-	if err != nil {
-		w.logf("refresh volumes: %v", err)
-		w.event(corev1.EventTypeWarning, "FailedMount", "%v", err)
-		return
-	}
-	if changed {
-		w.logf("volumes updated")
-	}
-}
-
-// gcVolumes removes timestamp directories the volumes retired.
-func (w *podWorker) gcVolumes(pod *corev1.Pod) {
-	dirs := w.podDirs()
-	for i := range pod.Spec.Volumes {
-		if v := &pod.Spec.Volumes[i]; podvm.Atomic(v) {
-			_ = podvm.GCAtomic(dirs.VolumeDir(v.Name), time.Now())
-		}
-	}
-}
-
-// exitCode reads the end of the console log: a guest that halted or
-// rebooted itself counts as a clean exit.
-func (w *podWorker) exitCode(ctx context.Context, id string) int32 {
-	var buf bytes.Buffer
-	if err := w.m.hull.Logs(ctx, id, false, 20, &buf); err != nil {
-		return exitCodeKilled
-	}
-	if strings.Contains(buf.String(), "guest stopped:") || strings.Contains(buf.String(), "reboot: ") {
-		return exitCodeClean
-	}
-	return exitCodeKilled
-}
-
-// teardown stops and removes the VM, frees the address and, when the pod
-// object still exists, deletes it with grace 0 as the kubelet does.
 func (w *podWorker) teardown(ctx context.Context) {
 	pod, gone := w.current()
 	st := w.snapshot()
@@ -889,11 +710,24 @@ func (w *podWorker) teardown(ctx context.Context) {
 	if gone {
 		grace = 2
 	}
+	bg := context.WithoutCancel(ctx)
 	if st.Created || st.Running {
-		w.event(corev1.EventTypeNormal, "Killing", "Stopping container %s", st.Container)
 		t0 := time.Now()
-		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Duration(grace+60)*time.Second)
-		err := w.m.hull.StopAndRemove(sctx, st.Instance, grace)
+		if st.Running && w.vmAlive(bg) {
+			for _, cs := range runningContainers(st.Guest) {
+				w.event(corev1.EventTypeNormal, "Killing", "Stopping container %s", cs)
+			}
+			cctx, cancel := context.WithTimeout(bg, 10*time.Second)
+			err := w.ctl(cctx, guest.CtlRequest{Op: guest.CtlStop, Grace: grace})
+			cancel()
+			if err != nil {
+				w.logf("stop through the supervisor: %v", err)
+			} else if !w.waitVMEnd(bg, time.Duration(grace+5)*time.Second) {
+				w.logf("VM %s still runs %d s after the stop; stopping it", st.Instance, grace+5)
+			}
+		}
+		sctx, cancel := context.WithTimeout(bg, 60*time.Second)
+		err := w.m.hull.StopAndRemove(sctx, st.Instance, 2)
 		cancel()
 		if err != nil {
 			w.logf("teardown %s: %v", st.Instance, err)
@@ -901,9 +735,12 @@ func (w *podWorker) teardown(ctx context.Context) {
 			w.logf("VM %s stopped and removed in %.1fs", st.Instance, time.Since(t0).Seconds())
 		}
 	}
+	if !gone {
+		w.finishStatus(bg)
+	}
 	w.m.sources.Release(w.uid)
 	w.m.src.forget(w.uid)
-	fctx, fcancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	fctx, fcancel := context.WithTimeout(bg, 10*time.Second)
 	removeForwards(fctx, w.m.gw, &st)
 	fcancel()
 	if err := w.m.ipam.Release(string(w.uid)); err != nil {
@@ -913,7 +750,7 @@ func (w *podWorker) teardown(ctx context.Context) {
 	if gone {
 		return
 	}
-	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	dctx, cancel := context.WithTimeout(bg, 10*time.Second)
 	defer cancel()
 	err := w.m.cs.CoreV1().Pods(w.ns).Delete(dctx, w.name, metav1.DeleteOptions{
 		GracePeriodSeconds: ptr.To[int64](0),
@@ -922,4 +759,40 @@ func (w *podWorker) teardown(ctx context.Context) {
 	if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
 		w.logf("delete: %v", err)
 	}
+}
+
+// runningContainers names the containers the guest last reported running.
+func runningContainers(g *guest.Status) []string {
+	var out []string
+	if g == nil {
+		return out
+	}
+	for _, c := range g.Containers {
+		if c.State == guest.StateRunning {
+			out = append(out, c.Name)
+		}
+	}
+	return out
+}
+
+// vmAlive reports whether the pod's VMM process runs.
+func (w *podWorker) vmAlive(ctx context.Context) bool {
+	in, err := w.m.hull.Inspect(ctx, w.snapshot().Instance)
+	return err == nil && in.Alive()
+}
+
+// waitVMEnd waits up to d for the VM to power off.
+func (w *podWorker) waitVMEnd(ctx context.Context, d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if !w.vmAlive(ctx) {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+	return false
 }

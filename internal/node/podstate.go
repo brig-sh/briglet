@@ -20,6 +20,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/brig-sh/briglet/internal/guest"
 )
 
 // podState is what the agent knows about one pod beyond the API object. It
@@ -29,45 +31,61 @@ type podState struct {
 	UID       string `json:"uid"`
 	Namespace string `json:"namespace"`
 	Name      string `json:"name"`
-	Container string `json:"container"`
 	Instance  string `json:"instance"`
 	IP        string `json:"ip,omitempty"`
-	// Env is the container environment, also given to kubectl exec.
-	Env     []string `json:"env,omitempty"`
-	Image   string   `json:"image,omitempty"`
-	ImageID string   `json:"imageID,omitempty"`
+	// Images maps a container name to the image ID it runs.
+	Images map[string]string `json:"images,omitempty"`
 
-	RestartCount int32     `json:"restartCount"`
-	Running      bool      `json:"running"`
-	StartedAt    time.Time `json:"startedAt,omitempty"`
-	// Created is set once a VM for the pod has existed.
-	Created bool `json:"created,omitempty"`
+	// Created is set once a VM for the pod has existed. Running is set
+	// while the VM runs; StartedAt is when it booted.
+	Created   bool      `json:"created,omitempty"`
+	Running   bool      `json:"running"`
+	StartedAt time.Time `json:"startedAt,omitzero"`
 	// Done is set when the pod reached Succeeded or Failed and will not run
-	// again.
-	Done bool `json:"done,omitempty"`
+	// again. Phase is that phase; Reason and Message explain an end the
+	// guest did not report itself.
+	Done    bool   `json:"done,omitempty"`
+	Phase   string `json:"phase,omitempty"`
+	Reason  string `json:"reason,omitempty"`
+	Message string `json:"message,omitempty"`
 	// Rejected holds why the pod cannot run on briglet.
 	Rejected string `json:"rejected,omitempty"`
+	// RejectedReason is the status reason of a rejection; empty means
+	// podvm.ReasonUnsupported.
+	RejectedReason string `json:"rejectedReason,omitempty"`
+	// Deadline is set when activeDeadlineSeconds elapsed and the pod was
+	// stopped for it.
+	Deadline bool `json:"deadline,omitempty"`
 
-	// Started is set once the startup probe passed, or at start without
-	// one. Ready is the readiness the probes give the running container.
-	Started bool `json:"started,omitempty"`
-	Ready   bool `json:"ready,omitempty"`
-	// Probes holds the last result and the consecutive counts of each
-	// probe of the running container, keyed by kind, so an agent restart
-	// does not reset them.
-	Probes map[string]*probeState `json:"probes,omitempty"`
+	// Waiting is why the containers wait while no VM runs: a pull, a
+	// config error, a failed boot.
+	Waiting *waitingState `json:"waiting,omitempty"`
+	// Guest is the last status.json of the current or the last VM.
+	Guest *guest.Status `json:"guest,omitempty"`
+	// Restarts carries the containers' restart counts into the next VM.
+	Restarts map[string]int32 `json:"restarts,omitempty"`
+	// Containers holds the probe results of each container's current run.
+	Containers map[string]*ctrState `json:"containers,omitempty"`
 	// Forwards maps a container port to the 127.0.0.1 address the gateway
 	// forwards to it. httpGet probes use them.
 	Forwards map[string]string `json:"forwards,omitempty"`
 	// TokenRefreshAt is when the next service account token in a volume is
 	// due. Zero when no volume holds one.
-	TokenRefreshAt time.Time `json:"tokenRefreshAt,omitempty"`
+	TokenRefreshAt time.Time `json:"tokenRefreshAt,omitzero"`
+}
 
-	Waiting  *waitingState `json:"waiting,omitempty"`
-	LastTerm *termState    `json:"lastTerm,omitempty"`
-	// Term is the current terminated state of a container that will not
-	// restart (Done) or waits for a restart (back-off).
-	Term *termState `json:"term,omitempty"`
+// ctrState is the agent's side of one container run: probe results and
+// what it already announced with events.
+type ctrState struct {
+	// Run is the start time of the run the fields describe.
+	Run time.Time `json:"run"`
+	// Started is set once the startup probe passed, or at start without
+	// one. Ready is the readiness the probes give the container.
+	Started bool                   `json:"started,omitempty"`
+	Ready   bool                   `json:"ready,omitempty"`
+	Probes  map[string]*probeState `json:"probes,omitempty"`
+	// BackOff is the end of the run the last BackOff event was about.
+	BackOff time.Time `json:"backOff,omitzero"`
 }
 
 type probeState struct {
@@ -79,37 +97,58 @@ type probeState struct {
 }
 
 // clone copies the state deeply enough for a reader outside the worker.
+// Guest is replaced, never changed in place, so it is shared.
 func (st podState) clone() podState {
-	st.Env = append([]string(nil), st.Env...)
-	if st.Probes != nil {
-		probes := make(map[string]*probeState, len(st.Probes))
-		for k, v := range st.Probes {
+	st.Images = cloneMap(st.Images)
+	st.Restarts = cloneMap(st.Restarts)
+	st.Forwards = cloneMap(st.Forwards)
+	if st.Containers != nil {
+		cs := make(map[string]*ctrState, len(st.Containers))
+		for k, v := range st.Containers {
 			c := *v
-			probes[k] = &c
+			if v.Probes != nil {
+				c.Probes = make(map[string]*probeState, len(v.Probes))
+				for pk, pv := range v.Probes {
+					p := *pv
+					c.Probes[pk] = &p
+				}
+			}
+			cs[k] = &c
 		}
-		st.Probes = probes
-	}
-	if st.Forwards != nil {
-		fw := make(map[string]string, len(st.Forwards))
-		for k, v := range st.Forwards {
-			fw[k] = v
-		}
-		st.Forwards = fw
+		st.Containers = cs
 	}
 	return st
 }
 
-type waitingState struct {
-	Reason  string `json:"reason"`
-	Message string `json:"message,omitempty"`
+func cloneMap[V any](m map[string]V) map[string]V {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]V, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
-type termState struct {
-	ExitCode   int32     `json:"exitCode"`
-	Reason     string    `json:"reason"`
-	Message    string    `json:"message,omitempty"`
-	StartedAt  time.Time `json:"startedAt"`
-	FinishedAt time.Time `json:"finishedAt"`
+// ctr returns the state of the named container, creating it.
+func (st *podState) ctr(name string) *ctrState {
+	if st.Containers == nil {
+		st.Containers = map[string]*ctrState{}
+	}
+	c := st.Containers[name]
+	if c == nil {
+		c = &ctrState{}
+		st.Containers[name] = c
+	}
+	return c
+}
+
+type waitingState struct {
+	// Container names the container the reason is about; empty means all.
+	Container string `json:"container,omitempty"`
+	Reason    string `json:"reason"`
+	Message   string `json:"message,omitempty"`
 }
 
 func podDir(root, uid string) string { return filepath.Join(root, uid) }

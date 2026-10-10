@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/utils/ptr"
 
+	"github.com/brig-sh/briglet/internal/guest"
 	"github.com/brig-sh/briglet/internal/hull"
 )
 
@@ -133,17 +134,6 @@ func TestEnv(t *testing.T) {
 	_, err = Env(context.Background(), EnvInput{Pod: pod, Container: c, Image: &hull.ImageConfig{}, Src: testSources()})
 	if !apierrors.IsNotFound(err) {
 		t.Errorf("missing secret: err = %v, want NotFound", err)
-	}
-
-	plain, secret, err := HullEnv(want)
-	if err != nil || len(secret) != 3 || strings.Contains(strings.Join(plain, " "), "s3cret") {
-		t.Errorf("HullEnv: plain %q secret %q err %v", plain, secret, err)
-	}
-	if _, _, err := HullEnv([]EnvVar{{Name: "HOME", Value: "x", Secret: true}}); err == nil {
-		t.Error("HullEnv: a secret HOME passed")
-	}
-	if _, _, err := HullEnv([]EnvVar{{Name: "CERT", Value: "a\nb"}}); err == nil {
-		t.Error("HullEnv: a value with a newline passed")
 	}
 }
 
@@ -298,9 +288,9 @@ func TestPayload(t *testing.T) {
 	}
 }
 
-func TestShares(t *testing.T) {
+func TestMounts(t *testing.T) {
 	root := t.TempDir()
-	dirs := PodDirs{Volumes: filepath.Join(root, "volumes"), Subpath: filepath.Join(root, "subpath")}
+	dirs := NewPodDirs(filepath.Join(root, "pod"))
 	host := filepath.Join(root, "host")
 	if err := os.MkdirAll(filepath.Join(host, "sub"), 0o755); err != nil {
 		t.Fatal(err)
@@ -318,8 +308,9 @@ func TestShares(t *testing.T) {
 		{Name: "cache", MountPath: "/logs", SubPathExpr: "$(POD)/logs"},
 		{Name: "cfg", MountPath: "/usr/share/nginx/html"},
 		{Name: "cfg", MountPath: "/etc/app/index.html", SubPath: "index.html"},
-		{Name: "host", MountPath: "/etc/app/app.conf", SubPath: "file.conf", ReadOnly: true},
+		{Name: "host", MountPath: "/etc/x.conf", SubPath: "file.conf", ReadOnly: true},
 		{Name: "host", MountPath: "/data", SubPath: "sub", ReadOnly: true},
+		{Name: "host", MountPath: "/rw"},
 	}}
 	if err := PrepareVolumes(pod, dirs); err != nil {
 		t.Fatal(err)
@@ -331,32 +322,38 @@ func TestShares(t *testing.T) {
 	if _, err := WriteAtomic(dirs.VolumeDir("cfg"), payload, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	got, err := Shares(pod, c, dirs, []EnvVar{{Name: "POD", Value: "web-1"}})
+	var hs HostShares
+	got, err := Mounts(pod, c, 2, dirs, []EnvVar{{Name: "POD", Value: "web-1"}}, &hs)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []hull.Share{
-		{Host: dirs.VolumeDir("cache"), Guest: "/cache"},
-		{Host: filepath.Join(dirs.VolumeDir("cache"), "web-1", "logs"), Guest: "/logs"},
-		{Host: dirs.VolumeDir("cfg"), Guest: "/usr/share/nginx/html", ReadOnly: true},
-		{Host: filepath.Join(host, "sub"), Guest: "/data", ReadOnly: true},
-		{Host: filepath.Join(dirs.Subpath, "f0"), Guest: "/etc/app", ReadOnly: true},
+	want := []guest.Mount{
+		{Source: "/run/briglet/volumes/cache", Destination: "/cache"},
+		{Source: "/run/briglet/volumes/cache/web-1/logs", Destination: "/logs"},
+		{Source: "/run/briglet/volumes/cfg", Destination: "/usr/share/nginx/html", ReadOnly: true},
+		{Source: "/run/briglet/subpath/c2m3", Destination: "/etc/app/index.html", ReadOnly: true},
+		{Source: "/run/briglet/subpath/c2m4", Destination: "/etc/x.conf", ReadOnly: true},
+		{Source: "/run/briglet/host/0", Destination: "/data", ReadOnly: true},
+		{Source: "/run/briglet/host/1", Destination: "/rw"},
 	}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("Shares =\n%+v\nwant\n%+v", got, want)
+		t.Errorf("Mounts =\n%+v\nwant\n%+v", got, want)
 	}
-	if b, _ := os.ReadFile(filepath.Join(dirs.Subpath, "f0", "index.html")); string(b) != "<h1>hi</h1>" {
+	wantShares := []hull.Share{{Host: filepath.Join(host, "sub"), Guest: "/run/briglet/host/0", ReadOnly: true}, {Host: host, Guest: "/run/briglet/host/1"}}
+	if !reflect.DeepEqual(hs.Shares, wantShares) {
+		t.Errorf("host shares = %+v", hs.Shares)
+	}
+	if st, err := os.Stat(filepath.Join(dirs.VolumeDir("cache"), "web-1", "logs")); err != nil || !st.IsDir() {
+		t.Errorf("subPathExpr directory: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dirs.Subpath, "c2m3")); string(b) != "<h1>hi</h1>" {
 		t.Errorf("file subPath copy = %q", b)
 	}
-	if b, _ := os.ReadFile(filepath.Join(dirs.Subpath, "f0", "app.conf")); string(b) != "conf" {
+	if b, _ := os.ReadFile(filepath.Join(dirs.Subpath, "c2m4")); string(b) != "conf" {
 		t.Errorf("hostPath file subPath link = %q", b)
 	}
-	c.VolumeMounts = []corev1.VolumeMount{{Name: "host", MountPath: "/etc/x.conf", SubPath: "file.conf"}}
-	if _, err := Shares(pod, c, dirs, nil); err == nil {
-		t.Error("a file subPath covering /etc was accepted")
-	}
 	c.VolumeMounts = []corev1.VolumeMount{{Name: "cache", MountPath: "/x", SubPathExpr: "$(UP)"}}
-	if _, err := Shares(pod, c, dirs, []EnvVar{{Name: "UP", Value: "../.."}}); err == nil {
+	if _, err := Mounts(pod, c, 0, dirs, []EnvVar{{Name: "UP", Value: "../.."}}, &hs); err == nil {
 		t.Error("a subPathExpr leaving the volume was accepted")
 	}
 }

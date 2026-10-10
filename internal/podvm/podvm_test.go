@@ -18,11 +18,13 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 
 	"github.com/brig-sh/briglet/internal/hull"
 )
@@ -82,11 +84,18 @@ func TestValidate(t *testing.T) {
 	if r := Validate(ok); r != "" {
 		t.Errorf("Validate(ok) = %q", r)
 	}
+	multi := ok.DeepCopy()
+	multi.Spec.Containers = append(multi.Spec.Containers, corev1.Container{Name: "d"})
+	multi.Spec.InitContainers = []corev1.Container{{Name: "i"}}
+	multi.Spec.SecurityContext = &corev1.PodSecurityContext{RunAsUser: ptr.To[int64](1000)}
+	if r := Validate(multi); r != "" {
+		t.Errorf("Validate(init, two containers, runAsUser) = %q", r)
+	}
 	bad := ok.DeepCopy()
 	bad.Spec.HostNetwork = true
-	bad.Spec.Containers = append(bad.Spec.Containers, corev1.Container{Name: "d"})
-	if r := Validate(bad); r == "" {
-		t.Error("Validate(hostNetwork, two containers) passed")
+	bad.Spec.EphemeralContainers = []corev1.EphemeralContainer{{}}
+	if r := Validate(bad); !strings.Contains(r, "hostNetwork") || !strings.Contains(r, "ephemeral") {
+		t.Errorf("Validate(hostNetwork, ephemeral) = %q", r)
 	}
 }
 
