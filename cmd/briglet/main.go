@@ -130,6 +130,11 @@ func cmdNode(ctx context.Context, args []string) error {
 		GuestBinDir:    p.GuestBin,
 		BaseImage:      os.Getenv("BRIGLET_BASE_IMAGE"),
 		RegistryMirror: os.Getenv("BRIGLET_REGISTRY_MIRROR"),
+		RootfsMode:     os.Getenv("BRIGLET_ROOTFS_MODE"),
+		BootAssets:     os.Getenv("HULL_BOOT_ASSETS"),
+	}
+	if err := node.CheckRootfsMode(cfg.RootfsMode); err != nil {
+		return err
 	}
 	if cfg.BaseImage == "" {
 		cfg.BaseImage = "busybox:latest"

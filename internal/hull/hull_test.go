@@ -15,6 +15,8 @@
 package hull
 
 import (
+	"context"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -70,5 +72,66 @@ func TestNormalizeRef(t *testing.T) {
 	}
 	if got := MirrorRef("busybox", ""); got != "busybox" {
 		t.Errorf("MirrorRef without a mirror = %q", got)
+	}
+}
+
+// Image disks are flags before the --, and their serials follow the root's
+// pair when the root is overlay-block.
+func TestRunArgsImageDisks(t *testing.T) {
+	spec := RunSpec{
+		Name: "x", Image: "busybox", Pull: "missing", MemMB: 64, CPUs: 1,
+		GatewaySock: "/s", GatewayCIDR: "10.87.0.10/24",
+		OverlayBlock: true,
+		ImageDisks:   []string{"nginx:alpine", "redis"},
+		Argv:         []string{"sleep", "1"},
+	}
+	args := RunArgs(spec)
+	line := strings.Join(args, " ")
+	for _, want := range []string{"--image-disk nginx:alpine", "--image-disk redis"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("missing %q in %s", want, line)
+		}
+	}
+	dash := slices.Index(args, "--")
+	if dash < 0 || slices.Index(args, "--image-disk") > dash || args[dash+1] != "busybox" {
+		t.Errorf("flags must precede -- and the image: %s", line)
+	}
+	if spec.ImageDiskSerial(0) != "disk2" || spec.ImageDiskSerial(1) != "disk3" {
+		t.Errorf("serials %s %s, want disk2 disk3", spec.ImageDiskSerial(0), spec.ImageDiskSerial(1))
+	}
+	spec.OverlayBlock = false
+	if spec.ImageDiskSerial(0) != "disk0" {
+		t.Errorf("without an overlay-block root the first image is %s, want disk0", spec.ImageDiskSerial(0))
+	}
+}
+
+// The overlay-block mode and the boot assets travel in hull's environment.
+func TestRunEnvCarriesRootfsModeAndBootAssets(t *testing.T) {
+	dir := t.TempDir()
+	out := dir + "/env"
+	script := dir + "/hull"
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nenv > "+out+"\necho id\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := New(script, dir)
+	c.BootAssets = "/assets"
+	if _, err := c.Run(context.Background(), RunSpec{Name: "x", Image: "i", OverlayBlock: true, SecretEnv: []string{"K=v"}}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"HULL_ROOTFS_MODE=overlay-block", "HULL_BOOT_ASSETS=/assets", "K=v"} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("hull did not see %s", want)
+		}
+	}
+	if _, err := c.Run(context.Background(), RunSpec{Name: "y", Image: "i"}); err != nil {
+		t.Fatal(err)
+	}
+	b, _ = os.ReadFile(out)
+	if strings.Contains(string(b), "HULL_ROOTFS_MODE=overlay-block") && os.Getenv("HULL_ROOTFS_MODE") == "" {
+		t.Error("the default mode set HULL_ROOTFS_MODE")
 	}
 }

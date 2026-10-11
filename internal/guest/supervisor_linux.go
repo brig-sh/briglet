@@ -221,6 +221,7 @@ func (s *supervisor) prepareVM() {
 		log.Printf("logs: %v", err)
 	}
 	_ = os.MkdirAll(scratchDir, 0o700)
+	mountBlockRoots(s.pod)
 }
 
 func isMountPoint(p string) bool {

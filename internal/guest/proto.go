@@ -57,6 +57,12 @@ type Pod struct {
 	GraceSeconds int `json:"graceSeconds,omitempty"`
 	// ShmMB sizes the pod's /dev/shm.
 	ShmMB int `json:"shmMB,omitempty"`
+	// ScratchDisk is the virtio-blk serial of the writable ext4 disk that
+	// holds the upper layers of containers whose image is a disk
+	// (Container.RootfsDisk). Each container gets a directory of its own on
+	// it, emptied at every start. It is the root's upper disk, which the
+	// supervisor mounts a second time.
+	ScratchDisk string `json:"scratchDisk,omitempty"`
 	// Sysctls are written to /proc/sys before any container starts.
 	Sysctls map[string]string `json:"sysctls,omitempty"`
 	// Containers holds the init containers in order, then the regular
@@ -73,14 +79,25 @@ type Container struct {
 	Init          bool `json:"init,omitempty"`
 	RestartAlways bool `json:"restartAlways,omitempty"`
 	// Rootfs is the guest path of the image's root filesystem, a read-only
-	// share. The supervisor puts a tmpfs-backed overlay on top of it.
-	Rootfs string   `json:"rootfs"`
-	Argv   []string `json:"argv"`
-	Env    []string `json:"env"`
-	Cwd    string   `json:"cwd"`
-	UID    uint32   `json:"uid"`
-	GID    uint32   `json:"gid"`
-	Groups []uint32 `json:"groups,omitempty"`
+	// share. The supervisor puts a tmpfs-backed overlay on top of it. With
+	// RootfsDisk set it is only the fallback for a disk the supervisor
+	// cannot use, and may be empty.
+	Rootfs string `json:"rootfs"`
+	// RootfsDisk is the virtio-blk serial of a read-only ext4 disk that
+	// holds the image's root filesystem. The supervisor mounts it and
+	// puts an overlay on top whose upper layer is a directory of the pod's
+	// ScratchDisk, so the writable layer is on disk and not in memory.
+	RootfsDisk string   `json:"rootfsDisk,omitempty"`
+	Argv       []string `json:"argv"`
+	Env        []string `json:"env"`
+	Cwd        string   `json:"cwd"`
+	UID        uint32   `json:"uid"`
+	GID        uint32   `json:"gid"`
+	Groups     []uint32 `json:"groups,omitempty"`
+	// UpperBase is set by the supervisor, never by the agent: the
+	// directory on the scratch disk that holds this run's upper, work and
+	// root directories, in place of the tmpfs.
+	UpperBase string `json:"upperBase,omitempty"`
 	// MemoryMB sizes the tmpfs that holds the container's writable layer.
 	MemoryMB       int  `json:"memoryMB"`
 	ReadOnlyRootfs bool `json:"readOnlyRootfs,omitempty"`

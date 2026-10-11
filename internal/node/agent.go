@@ -88,6 +88,29 @@ type Config struct {
 	// RegistryMirror is a registry host that mirrors Docker Hub, such as
 	// mirror.gcr.io. Docker Hub images are pulled from it when it is set.
 	RegistryMirror string
+	// RootfsMode is "" or "share" (containers run from a virtio-fs share of
+	// the image with a tmpfs upper) or "overlay-block" (hull boots the base
+	// image from block devices and attaches each container image as a
+	// read-only ext4 disk, with the writable layer on disk).
+	RootfsMode string
+	// BootAssets is the HULL_BOOT_ASSETS directory hull boots from, for the
+	// block-lower initrd overlay-block needs.
+	BootAssets string
+}
+
+// Rootfs modes.
+const (
+	RootfsShare        = "share"
+	RootfsOverlayBlock = "overlay-block"
+)
+
+// CheckRootfsMode validates the mode name.
+func CheckRootfsMode(mode string) error {
+	switch mode {
+	case "", RootfsShare, RootfsOverlayBlock:
+		return nil
+	}
+	return fmt.Errorf("BRIGLET_ROOTFS_MODE must be %q or %q (got %q)", RootfsShare, RootfsOverlayBlock, mode)
 }
 
 // Agent is a running node agent.
@@ -115,7 +138,16 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return err
 	}
+	if err := CheckRootfsMode(cfg.RootfsMode); err != nil {
+		return err
+	}
 	h := hull.New(cfg.HullBin, cfg.HullStore)
+	h.BootAssets = cfg.BootAssets
+	if cfg.RootfsMode == RootfsOverlayBlock {
+		if err := checkOverlayBlock(ctx, h); err != nil {
+			return err
+		}
+	}
 	shared := informers.NewSharedInformerFactory(cs, 0)
 	svcCIDR, err := netip.ParsePrefix(cfg.ServiceCIDR)
 	if err != nil {

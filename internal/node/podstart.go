@@ -92,6 +92,7 @@ func (w *podWorker) start(ctx context.Context) error {
 	var hs podvm.HostShares
 	images := map[string]string{}
 	imageShares := map[string]hull.Share{}
+	disks := newDiskPlan(w.m.overlayBlock, base.Digest)
 	for i, c := range podvm.AllContainers(pod) {
 		img, err := w.ensureImage(ctx, c.Name, c.Image, c.ImagePullPolicy)
 		if err != nil {
@@ -106,7 +107,12 @@ func (w *podWorker) start(ctx context.Context) error {
 			return configErr(c.Name, err)
 		}
 		gRootfs := guest.ImagesDir + "/" + short
-		imageShares[short] = hull.Share{Host: link, Guest: gRootfs, ReadOnly: true}
+		rootfsDisk := disks.assign(img.Digest, hull.MirrorRef(c.Image, w.m.registryMirror))
+		if rootfsDisk != "" {
+			gRootfs = ""
+		} else {
+			imageShares[short] = hull.Share{Host: link, Guest: gRootfs, ReadOnly: true}
+		}
 		images[c.Name] = imageID(c.Image, img)
 		env, err := podvm.Env(ctx, podvm.EnvInput{
 			Pod: pod, Container: c, Image: cfg, Facts: w.facts(pod),
@@ -117,7 +123,7 @@ func (w *podWorker) start(ctx context.Context) error {
 		}
 		gc, err := podvm.Container(pod, podvm.ContainerInput{
 			Container: c, Init: i < len(pod.Spec.InitContainers), Index: i, Image: cfg,
-			Rootfs: filepath.Join(h.StoreDir, "images", img.Digest, "rootfs"), GuestRootfs: gRootfs, Env: env,
+			Rootfs: filepath.Join(h.StoreDir, "images", img.Digest, "rootfs"), GuestRootfs: gRootfs, RootfsDisk: rootfsDisk, Env: env,
 		}, dirs, &hs)
 		if err != nil {
 			return configErr(c.Name, err)
@@ -125,6 +131,7 @@ func (w *podWorker) start(ctx context.Context) error {
 		gc.RestartCount = st.Restarts[c.Name]
 		gp.Containers = append(gp.Containers, gc)
 	}
+	gp.ScratchDisk = disks.scratch()
 	if err := w.writeGuestDir(pod, gp, ip); err != nil {
 		waiting("", "CreateContainerError", err.Error())
 		return err
@@ -155,6 +162,10 @@ func (w *podWorker) start(ctx context.Context) error {
 		Shares:      shares,
 		Argv:        []string{guest.Bin, "run", guest.PodFile},
 	}
+	if w.m.overlayBlock {
+		spec.OverlayBlock = true
+		spec.ImageDisks = disks.refs
+	}
 	var shareArgs []string
 	for _, sh := range shares {
 		shareArgs = append(shareArgs, sh.Guest)
@@ -170,6 +181,14 @@ func (w *podWorker) start(ctx context.Context) error {
 		w.event(corev1.EventTypeWarning, "Failed", "Error: %v", err)
 		_ = h.Rm(ctx, st.Instance, true)
 		return err
+	}
+	if w.m.overlayBlock {
+		if err := verifyDisks(h, st.Instance, spec, base.Digest, disks); err != nil {
+			waiting("", "RunContainerError", err.Error())
+			w.event(corev1.EventTypeWarning, "Failed", "Error: %v", err)
+			_ = h.StopAndRemove(ctx, st.Instance, 0)
+			return err
+		}
 	}
 	w.logf("VM %s up in %.1fs", st.Instance, time.Since(t0).Seconds())
 	w.set(func(st *podState) {

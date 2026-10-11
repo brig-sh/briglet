@@ -316,8 +316,12 @@ type ContainerInput struct {
 	Index  int
 	Image  *hull.ImageConfig
 	Rootfs string // the image rootfs on the host, for /etc/passwd
-	// GuestRootfs is where the VM sees the image rootfs.
+	// GuestRootfs is where the VM sees the image rootfs as a share. It is
+	// empty when the image is a disk.
 	GuestRootfs string
+	// RootfsDisk is the serial of the disk that holds the image, or empty
+	// when the image is a share.
+	RootfsDisk string
 	Env         []EnvVar
 }
 
@@ -389,6 +393,7 @@ func Container(pod *corev1.Pod, in ContainerInput, dirs PodDirs, hs *HostShares)
 		Init:           in.Init,
 		RestartAlways:  in.Init && isSidecar(c),
 		Rootfs:         in.GuestRootfs,
+		RootfsDisk:     in.RootfsDisk,
 		Argv:           argv,
 		Env:            pairs,
 		Cwd:            cwd,

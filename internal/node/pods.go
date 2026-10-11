@@ -92,6 +92,8 @@ type podManager struct {
 	baseImage string
 	// registryMirror, when set, serves every Docker Hub image.
 	registryMirror string
+	// overlayBlock boots pods from block devices; see Config.RootfsMode.
+	overlayBlock bool
 	// imageLinks holds a colon-free symlink to each image rootfs, since
 	// hull's share syntax splits on colons and digests carry one.
 	imageLinks  string
@@ -130,6 +132,7 @@ func newPodManager(cs kubernetes.Interface, cfg Config, h *hull.Client, shared i
 		guestBinDir:    cfg.GuestBinDir,
 		baseImage:      cfg.BaseImage,
 		registryMirror: cfg.RegistryMirror,
+		overlayBlock:   cfg.RootfsMode == RootfsOverlayBlock,
 		imageLinks:     filepath.Join(cfg.StateDir, "image-links"),
 		sources:        sw,
 		src:            &apiSources{cs: cs, watch: sw},

@@ -188,6 +188,10 @@ func NewCluster() (*Cluster, error) {
 		"--gateway-ip", GatewayIP,
 		"--service-cidr", ServiceCIDR,
 	)...)
+	if ba := os.Getenv("HULL_BOOT_ASSETS"); ba != "" {
+		// The gateway's hull resolves the same boot assets as the node's.
+		gateway.Env = append(gateway.Env, "HULL_BOOT_ASSETS="+ba)
+	}
 	gwAPI := hull.NewGateway(p.GatewayAPI)
 	// The node reports a LAN address when one exists, so other nodes and
 	// the Service stitching reach its kubelet; loopback keeps a

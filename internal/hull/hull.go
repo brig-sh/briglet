@@ -45,6 +45,10 @@ var ErrNotFound = errors.New("instance not found")
 type Client struct {
 	Bin      string
 	StoreDir string
+	// BootAssets, when set, is passed to hull as HULL_BOOT_ASSETS: the
+	// directory of kernel and initrd to boot instead of the published
+	// bundle.
+	BootAssets string
 }
 
 // Bin returns the hull binary to run: $HULL_BIN, else hull under binDir
@@ -84,6 +88,9 @@ func (c *Client) GlobalArgs() []string {
 
 func (c *Client) command(ctx context.Context, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, c.Bin, append(c.GlobalArgs(), args...)...)
+	if c.BootAssets != "" {
+		cmd.Env = append(os.Environ(), "HULL_BOOT_ASSETS="+c.BootAssets)
+	}
 	// A killed hull can leave a VMM child holding the pipes open.
 	cmd.WaitDelay = 2 * time.Second
 	return cmd
@@ -134,8 +141,31 @@ type RunSpec struct {
 	// the command line by key only, so `ps` does not show them.
 	SecretEnv []string // KEY=VALUE
 	Shares    []Share
-	Argv      []string // full guest argv; empty keeps the image default
+	// OverlayBlock boots from hull's overlay-block root (HULL_ROOTFS_MODE):
+	// the image's cached ext4 as disk0 and the instance's writable ext4 as
+	// disk1. It needs hull built with that mode and the block-lower boot
+	// assets.
+	OverlayBlock bool
+	// ImageDisks are images hull attaches as read-only ext4 disks
+	// (--image-disk), after the root's. The guest finds them by serial: with
+	// OverlayBlock the first is disk2, otherwise disk0.
+	ImageDisks []string
+	Argv       []string // full guest argv; empty keeps the image default
 }
+
+// Serial names the disk at position n on the VMM's command line.
+func Serial(n int) string { return "disk" + strconv.Itoa(n) }
+
+// RootDisks is how many disks the root image takes: two with OverlayBlock.
+func (s RunSpec) RootDisks() int {
+	if s.OverlayBlock {
+		return 2
+	}
+	return 0
+}
+
+// ImageDiskSerial is the serial of ImageDisks[i].
+func (s RunSpec) ImageDiskSerial(i int) string { return Serial(s.RootDisks() + i) }
 
 // Share is a host directory hull exports to the guest over virtio-fs. The
 // guest init creates Guest and mounts the share there before the command
@@ -179,6 +209,9 @@ func RunArgs(s RunSpec) []string {
 	for _, sh := range s.Shares {
 		args = append(args, "--shared-dir", sh.Arg())
 	}
+	for _, ref := range s.ImageDisks {
+		args = append(args, "--image-disk", ref)
+	}
 	// hull's flag parser reads flags after the image unless a -- ends them.
 	args = append(args, "--", s.Image)
 	return append(args, s.Argv...)
@@ -193,7 +226,16 @@ func (c *Client) Run(ctx context.Context, s RunSpec) (string, error) {
 	cmd := c.command(ctx, args...)
 	if len(s.SecretEnv) > 0 {
 		// exec dedups the environment keeping the last value of a key.
-		cmd.Env = append(os.Environ(), s.SecretEnv...)
+		if cmd.Env == nil {
+			cmd.Env = os.Environ()
+		}
+		cmd.Env = append(cmd.Env, s.SecretEnv...)
+	}
+	if s.OverlayBlock {
+		if cmd.Env == nil {
+			cmd.Env = os.Environ()
+		}
+		cmd.Env = append(cmd.Env, "HULL_ROOTFS_MODE=overlay-block")
 	}
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
@@ -378,6 +420,38 @@ func (c *Client) Pull(ctx context.Context, ref string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("hull pull %s: no digest in output", ref)
+}
+
+// DiskRecord is one disk of an instance, as hull lists it in disks.json.
+type DiskRecord struct {
+	Serial   string `json:"serial"`
+	Role     string `json:"role"`
+	Path     string `json:"path"`
+	ReadOnly bool   `json:"readOnly"`
+	Image    string `json:"image,omitempty"`
+	Digest   string `json:"digest,omitempty"`
+}
+
+// Disks reads the disk layout hull recorded for the instance, which maps each
+// serial to the image or role behind it.
+func (c *Client) Disks(id string) ([]DiskRecord, error) {
+	b, err := os.ReadFile(filepath.Join(c.StoreDir, "instances", id, "disks.json"))
+	if err != nil {
+		return nil, err
+	}
+	var m struct {
+		Disks []DiskRecord `json:"disks"`
+	}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, fmt.Errorf("disks.json of %s: %w", id, err)
+	}
+	return m.Disks, nil
+}
+
+// SupportsImageDisk reports whether this hull has the --image-disk flag.
+func (c *Client) SupportsImageDisk(ctx context.Context) bool {
+	out, err := exec.CommandContext(ctx, c.Bin, "run", "--help").CombinedOutput()
+	return err == nil && strings.Contains(string(out), "--image-disk")
 }
 
 // AgentSocket is the unix socket the VMM bridges to the in-guest agent.

@@ -55,6 +55,12 @@ func startContainer(pod *Pod, c *Container) (int, *logSink, error) {
 	if err != nil {
 		return 0, nil, err
 	}
+	// The container's own copy: an image disk and its upper directory are
+	// per run, and a restart starts again from the spec.
+	cc := *c
+	if _, err := useBlockRoot(&cc); err != nil {
+		return 0, logs, err
+	}
 	if c.TerminationLog != "" {
 		// Chmod after the create, so the umask cannot strip the write bit
 		// a non-root container needs to leave a termination message.
@@ -84,8 +90,7 @@ func startContainer(pod *Pod, c *Container) (int, *logSink, error) {
 	}
 	// The tmpfs must exist before the clone: the child copies the mount
 	// namespace as it is then.
-	cc := *c
-	cc.Mounts = podTmpfsMounts(c.Mounts)
+	cc.Mounts = podTmpfsMounts(cc.Mounts)
 	flags := uintptr(syscall.CLONE_NEWNS)
 	if !pod.ShareProcessNamespace {
 		flags |= syscall.CLONE_NEWPID
@@ -184,19 +189,25 @@ func setupAndExec(c *Container) error {
 		return fmt.Errorf("make / private: %w", err)
 	}
 	base := filepath.Join(scratchDir, c.Name)
-	if err := os.MkdirAll(base, 0o700); err != nil {
-		return err
-	}
-	mem := c.MemoryMB
-	if mem <= 0 {
-		mem = 512
-	}
-	if err := unix.Mount("tmpfs", base, "tmpfs", 0, fmt.Sprintf("size=%dm,mode=0700", mem)); err != nil {
-		return fmt.Errorf("tmpfs for the writable layer: %w", err)
+	if c.UpperBase != "" {
+		// The writable layer is a directory of the scratch disk, prepared
+		// by the supervisor.
+		base = c.UpperBase
+	} else {
+		if err := os.MkdirAll(base, 0o700); err != nil {
+			return err
+		}
+		mem := c.MemoryMB
+		if mem <= 0 {
+			mem = 512
+		}
+		if err := unix.Mount("tmpfs", base, "tmpfs", 0, fmt.Sprintf("size=%dm,mode=0700", mem)); err != nil {
+			return fmt.Errorf("tmpfs for the writable layer: %w", err)
+		}
 	}
 	root := filepath.Join(base, "root")
 	for _, d := range []string{"upper", "work", "root"} {
-		if err := os.Mkdir(filepath.Join(base, d), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Join(base, d), 0o755); err != nil {
 			return err
 		}
 	}
