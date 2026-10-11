@@ -1,0 +1,108 @@
+<svg class="dg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 680" role="img" aria-labelledby="dg-system-t dg-system-d">
+<title id="dg-system-t">A Pod, a Service and two Macs</title>
+<desc id="dg-system-d">kubectl talks to the apiserver on Mac 1. Each Mac runs a briglet node agent and a network gateway of its own. The agent builds the Service table from Services and EndpointSlices and installs it on its gateway: a pod on the same Mac is reached directly, the kubernetes Service maps to the apiserver, and a pod on the other Mac is reached through that Mac's address and the Service's node port. A ClusterIP-only Service whose pods live on the other Mac gets no entry. Pod addresses never leave a Mac, so each Mac needs a CoreDNS replica. Mac 2 joins with credentials from briglet join and reaches the apiserver at the address in its kubeconfig; the apiserver reaches Mac 2's agent for logs and exec.</desc>
+<style>
+.dg text { font-family: "Archivo","Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; font-size: 15px; fill: #0E2233; }
+.dg .dg-h { font-size: 16px; font-weight: 800; letter-spacing: -.01em; }
+.dg .dg-b { font-weight: 700; }
+.dg .dg-sub { font-size: 12.5px; fill: #4A5561; }
+.dg .dg-mono { font-family: "SFMono-Regular",Menlo,Consolas,"Liberation Mono",monospace; font-size: 13px; }
+.dg .dg-dim { fill: #6B7682; }
+.dg rect, .dg circle, .dg path { fill: none; stroke: #0E2233; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.dg .dg-bg { fill: #fff; stroke: none; }
+.dg .dg-zone { fill: #F5F6F8; }
+.dg .dg-vm { fill: #FDF5E6; stroke: #B9761C; stroke-width: 2.5; }
+.dg .dg-box { fill: #fff; }
+.dg .dg-on { stroke: #B9761C; stroke-width: 2.5; }
+.dg .dg-ok { stroke: #E7A33E; stroke-width: 3.5; stroke-dasharray: 9 7; animation: dg-flow 1s linear infinite; }
+.dg .dg-head { fill: #E7A33E; stroke: none; }
+.dg .dg-no { stroke: #C9CFD6; stroke-dasharray: 3 6; }
+.dg .dg-x { stroke: #B4401A; stroke-width: 3; }
+@keyframes dg-flow { to { stroke-dashoffset: -32; } }
+</style>
+<defs>
+<filter id="sk-system" x="-2%" y="-2%" width="104%" height="104%"><feTurbulence type="fractalNoise" baseFrequency="0.035" numOctaves="2" seed="7" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="3.2"/></filter>
+<marker id="ok-system" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="dg-head"/></marker>
+</defs>
+<rect class="dg-bg" x="0" y="0" width="1040" height="680"/>
+<g filter="url(#sk-system)">
+<rect class="dg-zone" x="20" y="70" width="600" height="590" rx="3"/>
+<rect class="dg-zone" x="660" y="70" width="360" height="590" rx="3"/>
+<rect class="dg-box" x="40" y="14" width="150" height="40" rx="3"/>
+<rect class="dg-box" x="40" y="120" width="270" height="96" rx="3"/>
+<rect class="dg-box" x="330" y="120" width="270" height="96" rx="3"/>
+<rect class="dg-box" x="40" y="250" width="560" height="116" rx="3"/>
+<rect class="dg-vm" x="40" y="410" width="270" height="86" rx="3"/>
+<rect class="dg-vm" x="330" y="410" width="270" height="86" rx="3"/>
+<rect class="dg-box" x="680" y="120" width="320" height="96" rx="3"/>
+<rect class="dg-box" x="680" y="250" width="320" height="116" rx="3"/>
+<rect class="dg-vm" x="680" y="410" width="320" height="86" rx="3"/>
+<rect class="dg-vm" x="680" y="516" width="320" height="70" rx="3"/>
+<path class="dg-ok" d="M115 54V116" marker-end="url(#ok-system)"/>
+<path class="dg-ok" d="M310 150H326" marker-end="url(#ok-system)"/>
+<path class="dg-ok" d="M326 186H314" marker-end="url(#ok-system)"/>
+<path class="dg-ok" d="M465 216V246" marker-end="url(#ok-system)"/>
+<path class="dg-ok" d="M175 410V370" marker-end="url(#ok-system)"/>
+<path class="dg-ok" d="M465 410V370" marker-end="url(#ok-system)"/>
+<path class="dg-ok" d="M840 216V246" marker-end="url(#ok-system)"/>
+<path class="dg-ok" d="M840 410V370" marker-end="url(#ok-system)"/>
+<path class="dg-ok" d="M680 140H640V40H230V116" marker-end="url(#ok-system)"/>
+<path class="dg-ok" d="M600 300H632V440H676" marker-end="url(#ok-system)"/>
+<path class="dg-ok" d="M680 330H648V350H604" marker-end="url(#ok-system)"/>
+<path class="dg-no" d="M175 496V512H840V496"/>
+<path class="dg-x" d="M498 502L518 522M518 502L498 522"/>
+</g>
+<text x="54" y="40" class="dg-mono dg-b">kubectl</text>
+<text x="40" y="100" class="dg-h">Mac 1</text>
+<text x="600" y="100" class="dg-sub" text-anchor="end">control plane and node · pods 10.87.0.0/25</text>
+<text x="680" y="100" class="dg-h">Mac 2</text>
+<text x="1000" y="100" class="dg-sub" text-anchor="end">node only · pods 10.87.0.128/25</text>
+<text x="435" y="34" class="dg-sub dg-dim" text-anchor="middle">watch, status, Lease: Mac 2 → apiserver :6443</text>
+<text x="54" y="145" class="dg-mono dg-b">kube-apiserver</text>
+<text x="54" y="166" class="dg-sub">etcd, scheduler, controllers</text>
+<text x="54" y="184" class="dg-sub">serves :6443 on the LAN</text>
+<text x="54" y="202" class="dg-sub">dials nodes on :10250: logs, exec</text>
+<text x="344" y="145" class="dg-mono dg-b">briglet node</text>
+<text x="344" y="166" class="dg-sub">InternalIP = --node-ip, :10250</text>
+<text x="344" y="184" class="dg-sub">one VM per Pod, from its /25</text>
+<text x="344" y="202" class="dg-sub">Services, slices → Service table</text>
+<text x="475" y="238" class="dg-sub dg-dim">PUT /services</text>
+<text x="54" y="275" class="dg-b">Network gateway</text>
+<text x="54" y="296" class="dg-sub">Service table: VIP:port → endpoints, round robin</text>
+<text x="54" y="316" class="dg-mono">10.96.0.10:53 → 10.87.0.10:53   a pod here</text>
+<text x="54" y="334" class="dg-mono">echo2-np VIP  → Mac 2:30082     a node port</text>
+<text x="54" y="354" class="dg-sub">a ClusterIP-only Service with pods on Mac 2 gets no row</text>
+<text x="54" y="435" class="dg-mono dg-b">web</text>
+<text x="296" y="435" class="dg-sub" text-anchor="end">10.87.0.26</text>
+<text x="54" y="456" class="dg-sub">wget http://echo2-np</text>
+<text x="54" y="474" class="dg-sub">→ CoreDNS, VIP, Mac 2's node port</text>
+<text x="54" y="492" class="dg-sub">wget http://10.87.0.160: no route</text>
+<text x="344" y="435" class="dg-mono dg-b">coredns</text>
+<text x="586" y="435" class="dg-sub" text-anchor="end">10.87.0.10</text>
+<text x="344" y="456" class="dg-sub">cluster names from the apiserver</text>
+<text x="344" y="474" class="dg-sub">Service 10.96.0.10 is ClusterIP</text>
+<text x="344" y="492" class="dg-sub">only, so it serves this Mac only</text>
+<text x="508" y="540" class="dg-sub dg-dim" text-anchor="middle">pod to pod: not routed</text>
+<text x="40" y="570" class="dg-sub">NodePorts listen on 0.0.0.0 on every Mac</text>
+<text x="40" y="588" class="dg-sub">and resolve the VIP through its table.</text>
+<text x="40" y="614" class="dg-sub">Between Macs only node addresses travel:</text>
+<text x="40" y="632" class="dg-sub">apiserver :6443, kubelet :10250, node ports.</text>
+<text x="694" y="145" class="dg-mono dg-b">briglet node</text>
+<text x="694" y="166" class="dg-sub">credentials from briglet join</text>
+<text x="694" y="184" class="dg-sub">apiserver at --server-ip (kubeconfig)</text>
+<text x="694" y="202" class="dg-sub">adopts spec.podCIDR, the other /25</text>
+<text x="850" y="238" class="dg-sub dg-dim">its own table</text>
+<text x="694" y="275" class="dg-b">Network gateway</text>
+<text x="694" y="296" class="dg-sub">started by hand on this Mac</text>
+<text x="694" y="316" class="dg-mono">echo2-np VIP → 10.87.0.160:80</text>
+<text x="694" y="334" class="dg-mono">web-np VIP   → Mac 1:30080</text>
+<text x="694" y="354" class="dg-sub">kube-dns → its replica below</text>
+<text x="694" y="435" class="dg-mono dg-b">echo2</text>
+<text x="986" y="435" class="dg-sub" text-anchor="end">10.87.0.160</text>
+<text x="694" y="456" class="dg-sub">Service echo2-np, nodePort 30082</text>
+<text x="694" y="474" class="dg-sub">reached from Mac 1 through this</text>
+<text x="694" y="492" class="dg-sub">Mac's node port; logs and exec work</text>
+<text x="694" y="541" class="dg-mono dg-b">coredns replica</text>
+<text x="694" y="562" class="dg-sub">one per Mac, scale the Deployment</text>
+<text x="694" y="578" class="dg-sub">outside names: Mac 1's gateway, unreached</text>
+</svg>
