@@ -1,0 +1,35 @@
+# Kubernetes conformance tests briglet skips, one ginkgo regex per line.
+# Pass the file's patterns joined with | to `--e2e-skip`, or to e2e.test
+# --ginkgo.skip. Each group names the cause. Source: the latest full
+# certified-conformance run (see README.md), whose failures match these
+# patterns exactly.
+
+# --- Unsupported by design: a pod is a VM and the node is a Mac ---
+# hostNetwork, hostPID and hostIPC have no meaning on this node.
+\[sig-network\] Networking Granular Checks: Pods should function for node-pod communication
+\[sig-node\] KubeletManagedEtcHosts
+# hostPort conflicts are a node-port-space concept; the gateway owns host ports.
+\[sig-network\] HostPort validates that there is no conflict
+# No cgroups inside the VM, so there is no in-place resize or OOMKilled.
+\[sig-node\] Pod InPlace Resize Container
+# Ephemeral containers need a running pod's sandbox to accept a new container.
+\[sig-node\] Ephemeral Containers
+# sysctls apply to the whole VM, not to one container.
+\[sig-node\] Sysctls \[LinuxOnly\]
+# fsGroup is applied as a supplementary group only; the host cannot chown
+# into the guest's view of a shared directory.
+should be consumable from pods in volume as non-root with defaultMode and fsGroup set
+# Image volumes (OCI artifacts as volumes) are not implemented.
+\[sig-node\] ImageVolume
+# The gateway routes Services round-robin per connection; no session affinity.
+\[sig-network\] Services should (be able to switch|have) session affinity
+# The API server on the Mac cannot dial pod addresses, so an aggregated API
+# server running in a pod is unreachable (Mac-to-pod traffic is the open item).
+\[sig-api-machinery\] Aggregator Should be able to support the 1.17 Sample API Server
+
+# --- Feature gates not enabled on this control plane (1.37 alpha/beta) ---
+\[FeatureGate:PodCertificateRequest\]
+\[FeatureGate:ClusterTrustBundle\]
+
+# --- Environment: the run used one node (the second was cordoned) ---
+\[sig-architecture\] Conformance Tests should have at least two untainted nodes
