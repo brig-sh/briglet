@@ -38,6 +38,9 @@ removed) with `|` and pass them with `--e2e-skip`.
 | 2026-10-11 | Mac Studio, nine fixes, overlay-block rootfs | 433 | 401 | 32 | 1 h 29 min |
 
 Passed counts exclude Sonobuoy's own harness entries (9 in the junit file).
+The runs are parallel (`E2E_PARALLEL=true`), so the 29 `[Serial]`
+conformance tests are skipped and are not in the counts; they need a
+separate serial run.
 Each row is one fresh run on one revision, except 2026-10-10, which had a
 34-minute infrastructure incident. The latest run's 32 failures are exactly
 the patterns in `skips.txt`: 18 unsupported by design, 13 behind feature
