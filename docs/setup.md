@@ -6,6 +6,14 @@ as native processes and boots one Linux microVM per pod through
 prerequisites: the control plane binaries built for darwin/arm64, and a
 hull runtime whose gateway knows about Services.
 
+![Terminal recording: on a Mac with no Go, kubectl or briglet, Homebrew installs Go and kubectl, fetch-prereqs.sh and make build briglet, briglet up starts a node, and an nginx pod reports a Linux kernel](assets/install.gif)
+
+The recording starts on a Mac with no Go, no kubectl and no briglet, and
+ends with a pod that runs its own Linux kernel. Two waits are cut short:
+the builds in `hack/fetch-prereqs.sh` and the first pull of
+`nginx:alpine`, which took about 50 s. On a MacBook Pro with a warm Go
+build cache, the whole run took under five minutes.
+
 ## What you need
 
 | Component | Where it comes from |

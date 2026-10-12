@@ -45,7 +45,8 @@ second node fit together.
 `~/.local/share/briglet/bin`, where briglet looks by default. What the
 script does, how to do it by hand, and the `BRIGLET_BIN_DIR`,
 `BRIGLET_K8S_BIN_DIR`, `BRIGLET_ETCD_BIN` and `HULL_BIN` overrides are in
-[docs/setup.md](docs/setup.md).
+[docs/setup.md](docs/setup.md), which opens with a recording of an install
+on a clean Mac.
 
 To pull Docker Hub images through Google's mirror, set
 `BRIGLET_REGISTRY_MIRROR=mirror.gcr.io` before starting the cluster.

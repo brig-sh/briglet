@@ -66,3 +66,43 @@ Hidden time is not recorded.
   `kubectl logs`.
 - The client pod's VM stays listed as `stopped` in `hull ps` until the
   namespace is deleted.
+
+## The install recording
+
+The GIF at the top of [docs/setup.md](setup.md) is generated from
+`docs/install.tape`. It needs a second Apple silicon Mac with Homebrew,
+the Xcode command line tools, the hull cask, and none of Go, kubectl or
+briglet. The tape runs here and types into that Mac over SSH, so the
+prompt, the paths and the node name are the only things that identify
+it:
+
+```sh
+scp docs/install-shell.sh user@clean-mac:install-shell.sh
+DEMO_HOST=user@clean-mac vhs docs/install.tape
+```
+
+`install-shell.sh` puts Homebrew on PATH, sets a plain `$ ` prompt and
+names the node `mac`. The tape installs Go and kubectl with Homebrew,
+clones briglet, runs `hack/fetch-prereqs.sh` and `make`, starts the
+cluster, runs an nginx pod and compares `uname` on the Mac and in the
+pod. A hidden last step runs `briglet down --wipe` and removes the clone;
+Go, kubectl and `~/.local/share/briglet` stay on the second Mac.
+
+The tape writes `install-raw.gif` and `install-raw.mp4`. The first pull of
+`nginx:alpine` leaves the screen idle for about 50 s, so the committed
+files cut that stretch, crop the empty bottom of the screen and hold the
+last frame for 10 s. Find the cut points in the raw recording (when
+`kubectl wait` is entered, and just before `condition met`), then:
+
+```sh
+CUT_FROM=56.5 CUT_TO=102.6
+F="[0:v]trim=0:$CUT_FROM,setpts=PTS-STARTPTS[a];[0:v]trim=start=$CUT_TO,setpts=PTS-STARTPTS[b];[a][b]concat=n=2:v=1[c];[c]crop=1400:560:0:0,tpad=stop_mode=clone:stop_duration=10"
+ffmpeg -i install-raw.mp4 -filter_complex "$F[out]" -map "[out]" \
+  -c:v libx264 -pix_fmt yuv420p -crf 20 -movflags +faststart docs/assets/install.mp4
+ffmpeg -i install-raw.gif -filter_complex \
+  "$F,split[s0][s1];[s0]palettegen=max_colors=64[p];[s1][p]paletteuse=dither=none[out]" \
+  -map "[out]" -loop 0 docs/assets/install.gif
+```
+
+VHS trims trailing spaces from the line it waits on, so the tape's
+`WaitPattern` matches a bare `$`.
