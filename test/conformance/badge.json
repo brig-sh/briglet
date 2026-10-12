@@ -1,0 +1,6 @@
+{
+  "schemaVersion": 1,
+  "label": "k8s 1.37 conformance",
+  "message": "401/433 passed",
+  "color": "yellowgreen"
+}
