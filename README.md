@@ -300,6 +300,10 @@ The node is named after the Mac's short hostname. Set `BRIGLET_NODE_NAME`
 before the first `briglet up` to choose another name; the name is in the
 node's certificates, so changing it later needs `briglet down --wipe`.
 
+The node's InternalIP is the address of the interface that holds the
+default route. Set `BRIGLET_NODE_IP` to pick another one, for instance on
+a Mac with a second network that other nodes cannot reach.
+
 ## Documentation
 
 - [docs/setup.md](docs/setup.md): prerequisites, where briglet looks for

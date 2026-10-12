@@ -42,10 +42,8 @@ func JoinBundle(name, nodeIP string, port int, serverIP, out string, w io.Writer
 		out = filepath.Join(p.Root, "join", name)
 	}
 	if serverIP == "" {
-		if ips := hostIPv4s(); len(ips) > 0 {
-			serverIP = ips[0].String()
-		} else {
-			serverIP = "127.0.0.1"
+		if serverIP, err = LANAddr(); err != nil {
+			return err
 		}
 	}
 	ca, err := ensureCA(p.PKI)
