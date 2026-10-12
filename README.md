@@ -1,5 +1,11 @@
 # Briglet
 
+[![Kubernetes conformance](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fbrig-sh%2Fbriglet%2Fmain%2Ftest%2Fconformance%2Fbadge.json)](test/conformance/)
+[![CodeQL](https://github.com/brig-sh/briglet/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/brig-sh/briglet/actions/workflows/github-code-scanning/codeql)
+[![Go](https://img.shields.io/github/go-mod/go-version/brig-sh/briglet)](go.mod)
+[![License](https://img.shields.io/github/license/brig-sh/briglet)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Apple%20silicon-lightgrey)](docs/setup.md)
+
 Briglet runs a Kubernetes control plane and node agent natively on Apple
 silicon Macs. Each Linux pod runs in a [Hull](https://github.com/brig-sh/hull)
 microVM using the hvi backend, with its own kernel. A guest supervisor

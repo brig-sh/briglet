@@ -45,3 +45,6 @@ gates this control plane does not enable, and 1 that needs two untainted
 nodes.
 
 Results tarballs and extracted junit files live under `~/.briglet/sonobuoy/`.
+
+`badge.json` feeds the conformance badge in the top-level README through
+the shields.io endpoint badge. Update its `message` with each new row.
