@@ -196,9 +196,9 @@ func NewCluster() (*Cluster, error) {
 	// The node reports a LAN address when one exists, so other nodes and
 	// the Service stitching reach its kubelet; loopback keeps a
 	// network-isolated Mac working.
-	nodeIP := NodeIP
-	if ips := hostIPv4s(); len(ips) > 0 {
-		nodeIP = ips[0].String()
+	nodeIP, err := LANAddr()
+	if err != nil {
+		return nil, err
 	}
 	node := NewProc(p, "node", self, "node",
 		"--kubeconfig="+p.Kubeconfig("node"),
