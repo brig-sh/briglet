@@ -12,5 +12,7 @@ guest:
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 $(GO) build -trimpath -o bin/briglet-guest ./cmd/briglet-guest
 
 test:
+	bash hack/test-verify-sha256.sh
+	bash hack/test-fetch-prereqs.sh
 	$(GO) test ./...
 	GOOS=linux GOARCH=arm64 $(GO) vet ./internal/guest ./cmd/briglet-guest
