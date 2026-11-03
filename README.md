@@ -36,9 +36,10 @@ second node fit together.
 - macOS on Apple silicon and Go 1.26.
 - etcd 3.7 and Kubernetes 1.37 built for darwin/arm64: kube-apiserver,
   kube-controller-manager and kube-scheduler.
-- Hull with the hvi backend, its boot assets, and a gateway that knows
-  about Services (`network-gateway --service-cidr`, on Hull's
-  `feat/gateway-services` branch until it ships in a release).
+- Hull v0.1.0, the release brig v0.5.1 installs, for hvi and vz-runner.
+- A hull CLI whose gateway knows about Services (`network-gateway
+  --service-cidr`). Until that ships in a release, it is built from hull's
+  `revive/overlay-block-image-disk` branch, which also has `run --image-disk`.
 - kubectl, for yourself and for the smoke checks (`KUBECTL` overrides).
 
 `hack/fetch-prereqs.sh` fetches or builds all of that into
@@ -85,23 +86,22 @@ Mac, because hull does not clone the base rootfs.
 ```sh
 brew install e2fsprogs
 export BRIGLET_ROOTFS_MODE=overlay-block
-export HULL_BIN=/path/to/hull            # built from hull's overlay-block branch
-export HULL_BOOT_ASSETS=/path/to/assets  # kernel and block-lower initrd
 bin/briglet up
 ```
 
-The mode needs three things, and the node agent refuses to start without the
-first two:
+The mode needs two things, and the node agent refuses to start without
+them:
 
 - Homebrew `e2fsprogs`: hull builds each image's ext4 with
   `/opt/homebrew/opt/e2fsprogs/sbin/mke2fs`, once per image digest.
-- A hull with `run --image-disk` (hull's `feat/overlay-block-rootfs` plus the
-  `--image-disk` commit; `hull run --help` lists the flag).
-- Boot assets whose initrd carries the block-lower init. `HULL_BOOT_ASSETS`
-  names a directory with `Image`, `container-initrd` and a `provenance.json`
-  that matches them. `briglet up` hands it to the gateway, and the node agent
-  to every hull it runs. When it is unset hull boots its published bundle,
-  which must have that init.
+- A hull with `run --image-disk`. The one `hack/fetch-prereqs.sh` builds
+  has it; `hull run --help` lists the flag.
+
+hull v0.1.0's published boot assets carry the block-lower init, so no
+`HULL_BOOT_ASSETS` is needed. To boot a local build of the assets, point
+`HULL_BOOT_ASSETS` at a directory with `Image`, `container-initrd` and a
+matching `provenance.json`. `briglet up` hands it to the gateway, and the
+node agent to every hull it runs.
 
 hvi attaches four disks, and the root takes two, so a pod gets two container
 images as disks. Containers of the base image run from the root's disk, and

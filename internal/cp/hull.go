@@ -64,7 +64,7 @@ func (c *Cluster) checkGatewayServices(pid int) error {
 	}
 	out, _ := exec.Command(c.Hull.Bin, "network-gateway", "--help").CombinedOutput()
 	if !strings.Contains(string(out), "--service-cidr") {
-		return fmt.Errorf("%s network-gateway has no --service-cidr flag, which Services need; set HULL_BIN to a hull built from the gateway services branch", c.Hull.Bin)
+		return fmt.Errorf("%s network-gateway has no --service-cidr flag, which Services need; set HULL_BIN to a hull built from hull's revive/overlay-block-image-disk branch, as hack/fetch-prereqs.sh does", c.Hull.Bin)
 	}
 	return nil
 }
