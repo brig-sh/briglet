@@ -82,13 +82,18 @@ echo "Ready lastHeartbeatTime: $h1 -> $h2"
 [ "$h1" != "$h2" ] || fail "node status was not updated in 11s"
 
 step "apiserver reaches the node agent with its kubelet client cert"
-# The node's InternalIP is 127.0.0.1 and the apiserver dials InternalIP, so
-# logs and exec work offline (hack/m1.sh exercises both). The node proxy
-# subresource refuses addresses that are not global unicast, so it cannot
-# reach a loopback node; check the address and the client cert directly.
+# The node's InternalIP is BRIGLET_NODE_IP when set, else the address of the
+# interface that holds the default route, else 127.0.0.1. The apiserver dials
+# InternalIP. The node proxy subresource refuses addresses that are not global
+# unicast, so it cannot reach a loopback node; check the address and the
+# client cert directly.
 addr=$("$KUBECTL" get node "$NODE" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
 echo "node InternalIP: $addr"
-[ "$addr" = "127.0.0.1" ] || fail "node InternalIP is $addr, not 127.0.0.1"
+if [ -n "${BRIGLET_NODE_IP:-}" ]; then
+	[ "$addr" = "$BRIGLET_NODE_IP" ] || fail "node InternalIP is $addr, not BRIGLET_NODE_IP $BRIGLET_NODE_IP"
+else
+	echo "$addr" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || fail "node InternalIP $addr is not an IPv4 address"
+fi
 p=$(curl -sS --cacert "$PKI/ca.crt" --cert "$PKI/apiserver-kubelet-client.crt" --key "$PKI/apiserver-kubelet-client.key" \
 	"https://$addr:10250/healthz")
 echo "https://$addr:10250/healthz with the apiserver kubelet client cert: $p"
@@ -96,7 +101,7 @@ echo "https://$addr:10250/healthz with the apiserver kubelet client cert: $p"
 if out=$("$KUBECTL" get --raw "/api/v1/nodes/$NODE/proxy/healthz" 2>&1); then
 	echo "/api/v1/nodes/$NODE/proxy/healthz: $out"
 else
-	echo "/api/v1/nodes/$NODE/proxy/healthz refused for a loopback node, as expected: $out"
+	echo "/api/v1/nodes/$NODE/proxy/healthz refused for a loopback node: $out"
 	echo "$out" | grep -q 'address not allowed' || fail "node proxy failed for another reason: $out"
 fi
 
