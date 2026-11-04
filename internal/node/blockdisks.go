@@ -115,7 +115,7 @@ func checkOverlayBlock(ctx context.Context, h *hull.Client) error {
 		return fmt.Errorf("BRIGLET_ROOTFS_MODE=overlay-block needs mke2fs at %s: %w (brew install e2fsprogs)", Mke2fs, err)
 	}
 	if !h.SupportsImageDisk(ctx) {
-		return fmt.Errorf("BRIGLET_ROOTFS_MODE=overlay-block needs a hull with `run --image-disk`: %s has none (set HULL_BIN to a hull built from hull's revive/overlay-block-image-disk branch, as hack/fetch-prereqs.sh does)", h.Bin)
+		return fmt.Errorf("BRIGLET_ROOTFS_MODE=overlay-block needs a hull with `run --image-disk`: %s has none (set HULL_BIN to a hull built from hull's feat/overlay-block-image-disk branch, as hack/fetch-prereqs.sh does)", h.Bin)
 	}
 	if h.BootAssets == "" {
 		log.Printf("overlay-block: HULL_BOOT_ASSETS is not set, so hull boots its published assets, whose initrd must carry the block-lower init")
