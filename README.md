@@ -39,7 +39,7 @@ second node fit together.
 - Hull v0.1.0, the release brig v0.5.1 installs, for hvi and vz-runner.
 - A hull CLI whose gateway knows about Services (`network-gateway
   --service-cidr`). Until that ships in a release, it is built from hull's
-  `revive/overlay-block-image-disk` branch, which also has `run --image-disk`.
+  `feat/overlay-block-image-disk` branch, which also has `run --image-disk`.
 - kubectl, for yourself and for the smoke checks (`KUBECTL` overrides).
 
 `hack/fetch-prereqs.sh` fetches or builds all of that into

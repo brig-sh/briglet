@@ -21,7 +21,7 @@ set -euo pipefail
 
 K8S_VERSION="${K8S_VERSION:-1.37.0}"
 HULL_REPO="${HULL_REPO:-https://github.com/brig-sh/hull.git}"
-HULL_REF="${HULL_REF:-revive/overlay-block-image-disk}"
+HULL_REF="${HULL_REF:-feat/overlay-block-image-disk}"
 HULL_VERSION="${HULL_VERSION:-v0.1.0}"
 # HULL_RELEASE_URL is where the release archive and its checksums.txt are
 # downloaded from. hack/test-fetch-prereqs.sh points it at a local fixture.
