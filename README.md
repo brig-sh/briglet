@@ -36,7 +36,8 @@ second node fit together.
 - macOS on Apple silicon and Go 1.26.
 - etcd 3.7 and Kubernetes 1.37 built for darwin/arm64: kube-apiserver,
   kube-controller-manager and kube-scheduler.
-- Hull v0.1.0, the release brig v0.5.1 installs, for hvi and vz-runner.
+- Hull v0.2.0, the release brig v0.6.0 installs, for hvi (0.1.0-rc.3) and
+  vz-runner.
 - A hull CLI whose gateway knows about Services (`network-gateway
   --service-cidr`). Until that ships in a release, it is built from hull's
   `feat/overlay-block-image-disk` branch, which also has `run --image-disk`.
@@ -97,7 +98,7 @@ them:
 - A hull with `run --image-disk`. The one `hack/fetch-prereqs.sh` builds
   has it; `hull run --help` lists the flag.
 
-hull v0.1.0's published boot assets carry the block-lower init, so no
+hull v0.2.0's published boot assets carry the block-lower init, so no
 `HULL_BOOT_ASSETS` is needed. To boot a local build of the assets, point
 `HULL_BOOT_ASSETS` at a directory with `Image`, `container-initrd` and a
 matching `provenance.json`. `briglet up` hands it to the gateway, and the

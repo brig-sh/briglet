@@ -7,7 +7,7 @@
 # have no darwin release, so they are built from a shallow clone of the
 # kubernetes repository at the same tag.
 #
-# Runtime: hvi and vz-runner come from the hull release that brig v0.5.1
+# Runtime: hvi and vz-runner come from the hull release that brig v0.6.0
 # installs, checked against the release's checksums.txt. The hull CLI is
 # built from HULL_REF, because `briglet up` needs `network-gateway
 # --service-cidr` for Services and `run --image-disk` for the overlay-block
@@ -22,7 +22,7 @@ set -euo pipefail
 K8S_VERSION="${K8S_VERSION:-1.37.0}"
 HULL_REPO="${HULL_REPO:-https://github.com/brig-sh/hull.git}"
 HULL_REF="${HULL_REF:-feat/overlay-block-image-disk}"
-HULL_VERSION="${HULL_VERSION:-v0.1.0}"
+HULL_VERSION="${HULL_VERSION:-v0.2.0}"
 # HULL_RELEASE_URL is where the release archive and its checksums.txt are
 # downloaded from. hack/test-fetch-prereqs.sh points it at a local fixture.
 HULL_RELEASE_URL="${HULL_RELEASE_URL:-https://github.com/brig-sh/hull/releases/download/$HULL_VERSION}"
