@@ -14,8 +14,8 @@ mkdir -p "$t/rel/src"
 printf '#!/bin/sh\necho hvi-fixture\n' >"$t/rel/src/hvi"
 printf '#!/bin/sh\necho vz-runner-fixture\n' >"$t/rel/src/vz-runner"
 chmod 0755 "$t/rel/src/hvi" "$t/rel/src/vz-runner"
-tar -czf "$t/rel/hull-0.1.0-arm64.tar.gz" -C "$t/rel/src" hvi vz-runner
-sum="$(shasum -a 256 "$t/rel/hull-0.1.0-arm64.tar.gz" | awk '{ print $1 }')"
+tar -czf "$t/rel/hull-0.2.0-arm64.tar.gz" -C "$t/rel/src" hvi vz-runner
+sum="$(shasum -a 256 "$t/rel/hull-0.2.0-arm64.tar.gz" | awk '{ print $1 }')"
 
 # The repository: a hull CLI whose help lists the flags the script checks,
 # on branch "good", and one without --service-cidr on branch "old".
@@ -46,7 +46,7 @@ run() {
 fail() { echo "FAIL: $*" >&2; cat "$t/$name.log" >&2; exit 1; }
 
 name=tampered
-printf '%064d  hull-0.1.0-arm64.tar.gz\n' 0 >"$t/rel/checksums.txt"
+printf '%064d  hull-0.2.0-arm64.tar.gz\n' 0 >"$t/rel/checksums.txt"
 if run "$name" good; then fail "a tampered checksums.txt was accepted"; fi
 grep -q 'failed verification' "$t/$name.log" || fail "no verification error"
 for b in hvi vz-runner hull; do
@@ -54,7 +54,7 @@ for b in hvi vz-runner hull; do
 done
 
 name=good
-printf '%s  hull-0.1.0-arm64.tar.gz\n' "$sum" >"$t/rel/checksums.txt"
+printf '%s  hull-0.2.0-arm64.tar.gz\n' "$sum" >"$t/rel/checksums.txt"
 run "$name" good || fail "a good release was refused"
 cmp -s "$t/rel/src/hvi" "$t/$name/bin/hvi" || fail "hvi differs from the release"
 cmp -s "$t/rel/src/vz-runner" "$t/$name/bin/vz-runner" || fail "vz-runner differs from the release"

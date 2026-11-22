@@ -21,7 +21,7 @@ build cache, the whole run took under five minutes.
 | Go 1.26 or newer | `brew install go` or [go.dev](https://go.dev/dl/) |
 | etcd 3.7, kube-apiserver, kubectl (1.37) | the kubebuilder envtest release |
 | kube-controller-manager, kube-scheduler (1.37) | built from the kubernetes source at the same tag; there is no darwin release |
-| hvi, vz-runner | the hull v0.1.0 release, which brig v0.5.1 installs |
+| hvi, vz-runner | the hull v0.2.0 release, which brig v0.6.0 installs |
 | hull CLI with `network-gateway --service-cidr` and `run --image-disk` | built from hull's `feat/overlay-block-image-disk` branch until that lands in a release |
 | boot assets | pulled by hull into its store on the first run |
 
@@ -47,7 +47,7 @@ Variables the script reads:
 | `BRIGLET_BIN_DIR` | `$XDG_DATA_HOME/briglet/bin` or `~/.local/share/briglet/bin` | where the binaries go |
 | `BRIGLET_CACHE_DIR` | `$XDG_CACHE_HOME/briglet` or `~/.cache/briglet` | source clones |
 | `K8S_VERSION` | `1.37.0` | Kubernetes tag to fetch and build |
-| `HULL_VERSION` | `v0.1.0` | hull release to take hvi and vz-runner from |
+| `HULL_VERSION` | `v0.2.0` | hull release to take hvi and vz-runner from |
 | `HULL_REPO`, `HULL_REF` | `brig-sh/hull`, `feat/overlay-block-image-disk` | where the hull CLI is built from |
 | `HULL_RELEASE_URL` | the `HULL_VERSION` release on GitHub | where the release archive and `checksums.txt` come from |
 | `SKIP_HULL` | unset | set to `1` to leave the runtime alone |
@@ -84,10 +84,10 @@ git clone --depth 1 --branch v1.37.0 https://github.com/kubernetes/kubernetes.gi
               && go build -o /path/to/bin/kube-scheduler ./cmd/kube-scheduler)
 
 # the runtime: hvi and vz-runner from the release, the hull CLI from source
-curl -fsSLO https://github.com/brig-sh/hull/releases/download/v0.1.0/hull-0.1.0-arm64.tar.gz
-curl -fsSLO https://github.com/brig-sh/hull/releases/download/v0.1.0/checksums.txt
-grep ' hull-0.1.0-arm64.tar.gz$' checksums.txt | shasum -a 256 -c
-tar -xzf hull-0.1.0-arm64.tar.gz -C /path/to/bin hvi vz-runner
+curl -fsSLO https://github.com/brig-sh/hull/releases/download/v0.2.0/hull-0.2.0-arm64.tar.gz
+curl -fsSLO https://github.com/brig-sh/hull/releases/download/v0.2.0/checksums.txt
+grep ' hull-0.2.0-arm64.tar.gz$' checksums.txt | shasum -a 256 -c
+tar -xzf hull-0.2.0-arm64.tar.gz -C /path/to/bin hvi vz-runner
 git clone --depth 1 --branch feat/overlay-block-image-disk https://github.com/brig-sh/hull.git
 (cd hull && go build -o /path/to/bin/hull ./cmd/hull)
 ```
